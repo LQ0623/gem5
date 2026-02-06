@@ -90,15 +90,19 @@ Gicv3Distributor::Gicv3Distributor(Gicv3 * gic, uint32_t it_lines)
       gicdPidr1(0xb4),
       gicdPidr2(gic->params().gicv4 ? 0x4b : 0x3b),
       gicdPidr3(0),
-      gicdPidr4(0x44)
+      gicdPidr4(0x44),
+      enable1ofNRR(gic->params().enable_1ofn_rr),
+      enable1ofNBusyAware(gic->params().enable_1ofn_busy),
+      rrCursor1ofN(-1), // <--- 初始化为 -1
+      lastRoutedCpu(it_lines, -1)
 {
     panic_if(it_lines > Gicv3::INTID_SECURE, "Invalid value for it_lines!");
     /*
      * RSS           [26]    == 1
      * (The implementation does supports targeted SGIs with affinity
      * level 0 values of 0 - 255)
-     * No1N          [25]    == 1
-     * (1 of N SPI interrupts are not supported)
+     * No1N          [25]    == 0
+     * (1 of N SPI interrupts is supported)
      * A3V           [24]    == 1
      * (Supports nonzero values of Affinity level 3)
      * IDbits        [23:19] == 0xf
@@ -121,7 +125,7 @@ Gicv3Distributor::Gicv3Distributor(Gicv3 * gic, uint32_t it_lines)
     bool have_security = gic->getSystem()->has(ArmExtension::SECURITY);
     int max_spi_int_id = itLines - 1;
     int it_lines_number = divCeil(max_spi_int_id + 1, 32) - 1;
-    gicdTyper = (1 << 26) | (1 << 25) | (1 << 24) | (IDBITS << 19) |
+    gicdTyper = (1 << 26) | (0 << 25) | (1 << 24) | (IDBITS << 19) |
         (1 << 17) | (1 << 16) |
         ((have_security ? 1 : 0) << 10) |
         (it_lines_number << 0);
@@ -422,6 +426,14 @@ Gicv3Distributor::read(Addr addr, size_t size, bool is_secure_access)
         if (isNotSPI(int_id)) {
             return 0;
         }
+
+        panic_if(addr == GICD_IROUTER.start() && int_id != 32,
+                "IROUTER mapping wrong: addr=%#x start=%#x int_id=%d\n",
+                addr, GICD_IROUTER.start(), int_id);
+
+        // Print a few accesses (optional; can be noisy)
+        DPRINTF(GIC, "GICD_IROUTER READ addr=%#x -> int_id=%d size=%zu\n",
+                addr, int_id, size);
 
         if (nsAccessToSecInt(int_id, is_secure_access))
         {
@@ -817,6 +829,13 @@ Gicv3Distributor::write(Addr addr, uint64_t data, size_t size,
             return;
         }
 
+        panic_if(addr == GICD_IROUTER.start() && int_id != 32,
+             "IROUTER mapping wrong (WRITE): addr=%#x start=%#x int_id=%d size=%zu data=%#llx\n",
+             addr, GICD_IROUTER.start(), int_id, size, data);
+
+        DPRINTF(GIC, "GICD_IROUTER WRITE addr=%#x -> int_id=%d size=%zu data=%#llx\n",
+                addr, int_id, size, data);
+
         if (nsAccessToSecInt(int_id, is_secure_access))
         {
             if (irqNsacr[int_id] < 3) {
@@ -1047,16 +1066,96 @@ Gicv3Distributor::route(uint32_t int_id)
 
     if (affinity_routing.IRM) {
         // Interrupts routed to any PE defined as a participating node
-        for (int i = 0; i < gic->getSystem()->threads.size(); i++) {
-            Gicv3Redistributor * redistributor_i =
-                gic->getRedistributor(i);
+        // for (int i = 0; i < gic->getSystem()->threads.size(); i++) {
+        //     Gicv3Redistributor * redistributor_i =
+        //         gic->getRedistributor(i);
 
-            if (redistributor_i->
-                    canBeSelectedFor1toNInterrupt(int_group)) {
-                target_redistributor = redistributor_i;
+        //     if (redistributor_i->
+        //             canBeSelectedFor1toNInterrupt(int_group)) {
+        //         target_redistributor = redistributor_i;
+        //         break;
+        //     }
+        // }
+        const int n = gic->getSystem()->threads.size();
+        if (n == 0) return nullptr;
+        int start = (rrCursor1ofN + 1) % n;
+        int chosen = -1;  // Initialize to invalid to detect if none found
+        if(enable1ofNBusyAware) {
+            for (int k = 0; k < n; k++) {  // Start from 0 to cover exactly n iterations
+                int i = (start + k) % n;
+                auto *rd = gic->getRedistributor(i);
+                auto *ci = rd->getCPUInterface();
+                DPRINTF(GIC, "1ofN probe i=%d group=%d selectable=%d busy=%d\n",
+                        i, int_group,
+                        rd->canBeSelectedFor1toNInterrupt(int_group),
+                        ci ? ci->isBusy(int_group) : -1);
+                
+                if(ci && ci->isBusy(int_group)) continue;
+
+                if (!rd || !rd->canBeSelectedFor1toNInterrupt(int_group)) continue;
+
+                target_redistributor = rd;
+                chosen = i;
                 break;
             }
+            if (!target_redistributor) {
+                for (int k = 0; k < n; k++) {  // Start from 0 to cover exactly n iterations
+                    int i = (start + k) % n;
+                    auto *rd = gic->getRedistributor(i);
+                    if (rd && rd->canBeSelectedFor1toNInterrupt(int_group)) {
+                        target_redistributor = rd;
+                        chosen = i;
+                        break;
+                    }
+                }
+            }
+
+            if(!target_redistributor) {
+                // No participating node -> keep pending
+                DPRINTF(GIC, "1ofN: no target found (all non-participating)\n");
+                return nullptr;
+            }
+
+            // Update rrCursor1ofN for the next round
+            rrCursor1ofN = chosen;
+            lastRoutedCpu[int_id] = chosen;
+
+            DPRINTF(GIC, "1ofN choose PE index=%d (rrCursor=%d)\n", chosen, rrCursor1ofN);
+        } else if(enable1ofNRR) {
+            for (int k = 0; k < n; k++) {  // Start from 0 to cover exactly n iterations
+                int i = (start + k) % n;
+                auto *rd = gic->getRedistributor(i);
+                if (rd && rd->canBeSelectedFor1toNInterrupt(int_group)) {
+                    target_redistributor = rd;
+                    chosen = i;
+                    break;
+                }
+            }
+            if (!target_redistributor) {
+                return nullptr;
+            }
+            // Update rrCursor1ofN for the next round
+            rrCursor1ofN = chosen;
+
+            DPRINTF(GIC, "rrCursor1ofN=%d, n = %d\n",
+                    rrCursor1ofN, n);
+        } else {
+
+            for (int i = 0; i < gic->getSystem()->threads.size(); i++) {
+                Gicv3Redistributor * redistributor_i =
+                    gic->getRedistributor(i);
+
+                if (redistributor_i->
+                        canBeSelectedFor1toNInterrupt(int_group)) {
+                    rrCursor1ofN = i;
+                    target_redistributor = redistributor_i;
+                    break;
+                }
+            }
+            DPRINTF(GIC, "select cpu is %d, n = %d\n",
+                    rrCursor1ofN, n);
         }
+
     } else {
         uint32_t affinity = (affinity_routing.Aff3 << 24) |
                             (affinity_routing.Aff2 << 16) |
@@ -1064,6 +1163,8 @@ Gicv3Distributor::route(uint32_t int_id)
                             (affinity_routing.Aff0 << 0);
         target_redistributor =
             gic->getRedistributorByAffinity(affinity);
+        DPRINTF(GIC, "IRM = 0, affinity=%d\n",
+                affinity);
     }
 
     if (!target_redistributor) {
@@ -1077,9 +1178,18 @@ Gicv3Distributor::route(uint32_t int_id)
 void
 Gicv3Distributor::clearIrqCpuInterface(uint32_t int_id)
 {
-    auto cpu_interface = route(int_id);
-    if (cpu_interface)
-        cpu_interface->resetHppi(int_id);
+    int idx = (int_id < lastRoutedCpu.size()) ? lastRoutedCpu[int_id] : -1;
+    if (idx >= 0) {
+        auto *ci = gic->getRedistributor(idx)->getCPUInterface();
+        if (ci) ci->resetHppi(int_id);
+    } else {
+        // fallback：如果从未路由过，再 route 一次（很少发生）
+        auto *ci = route(int_id);
+        if (ci) ci->resetHppi(int_id);
+    }
+    // auto cpu_interface = route(int_id);
+    // if (cpu_interface)
+    //     cpu_interface->resetHppi(int_id);
 }
 
 void
@@ -1222,6 +1332,7 @@ Gicv3Distributor::serialize(CheckpointOut & cp) const
     SERIALIZE_CONTAINER(irqGrpmod);
     SERIALIZE_CONTAINER(irqNsacr);
     SERIALIZE_CONTAINER(irqAffinityRouting);
+    SERIALIZE_SCALAR(rrCursor1ofN); // <--- 保存状态
 }
 
 void
@@ -1242,6 +1353,7 @@ Gicv3Distributor::unserialize(CheckpointIn & cp)
     UNSERIALIZE_CONTAINER(irqGrpmod);
     UNSERIALIZE_CONTAINER(irqNsacr);
     UNSERIALIZE_CONTAINER(irqAffinityRouting);
+    UNSERIALIZE_SCALAR(rrCursor1ofN); // <--- 恢复状态
 }
 
 } // namespace gem5

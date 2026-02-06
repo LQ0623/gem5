@@ -43,6 +43,7 @@
 
 #include "arch/arm/isa_device.hh"
 #include "dev/arm/gic_v3.hh"
+#include <array>
 
 namespace gem5
 {
@@ -370,6 +371,48 @@ class Gicv3CPUInterface : public ArmISA::BaseISADevice, public Serializable
     RegVal readMiscReg(int misc_reg) override;
     void setMiscReg(int misc_reg, RegVal val) override;
     void setThreadContext(ThreadContext *tc) override;
+
+  protected:
+    // === busy-aware 1-of-N support ===
+    static constexpr int BusyGroupCount = 3;
+
+    // Active IRQ counters per group (G0S, G1S, G1NS).
+    // If counter > 0, treat this PE as "busy" for that group.
+    std::array<uint32_t, BusyGroupCount> activeIrqCount = {0, 0, 0};
+
+    static int busyGroupIndex(Gicv3::GroupId group)
+    {
+        switch (group) {
+          case Gicv3::G0S:  return 0;
+          case Gicv3::G1S:  return 1;
+          case Gicv3::G1NS: return 2;
+          default:          return -1;
+        }
+    }
+
+    void markBusyOnActivate(Gicv3::GroupId group)
+    {
+        const int idx = busyGroupIndex(group);
+        if (idx >= 0) {
+            activeIrqCount[idx]++;
+        }
+    }
+
+    void markBusyOnDeactivate(Gicv3::GroupId group)
+    {
+        const int idx = busyGroupIndex(group);
+        if (idx >= 0 && activeIrqCount[idx] > 0) {
+            activeIrqCount[idx]--;
+        }
+    }
+
+  public:
+    bool isBusy(Gicv3::GroupId group) const
+    {
+        const int idx = busyGroupIndex(group);
+        return (idx >= 0) ? (activeIrqCount[idx] > 0) : false;
+    }
+
 };
 
 } // namespace gem5

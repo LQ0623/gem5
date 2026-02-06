@@ -274,6 +274,15 @@ class Gicv3Distributor : public Serializable
 
     void copy(Gicv3Registers *from, Gicv3Registers *to);
     void update();
+
+  private:
+    bool enable1ofNRR;
+    bool enable1ofNBusyAware;
+
+    // Round-robin cursor for IRM=1 routing (per-distributor)
+    uint32_t rrCursor1ofN = -1;
+    std::vector<int> lastRoutedCpu; // size = numInterrupts, init -1
+
 };
 
 } // namespace gem5

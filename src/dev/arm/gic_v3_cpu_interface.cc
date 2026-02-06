@@ -1858,6 +1858,11 @@ Gicv3CPUInterface::activateIRQ(uint32_t int_id, Gicv3::GroupId group)
         redistributor->setClrLPI(int_id, false);
     }
 
+    if (int_id < Gicv3::INTID_SECURE) {
+        DPRINTF(GIC, "BUSY++ cpu=%p group=%d count=%u intid=%u\n", this, group, activeIrqCount[busyGroupIndex(group)], int_id);
+        markBusyOnActivate(group);
+    }
+
     // By setting the priority to 0xff we are effectively
     // making the int_id not pending anymore at the cpu
     // interface.
@@ -1895,6 +1900,12 @@ Gicv3CPUInterface::deactivateIRQ(uint32_t int_id, Gicv3::GroupId group)
     } else if (int_id < Gicv3::INTID_SECURE) {
         // SPI, distributor
         distributor->deactivateIRQ(int_id);
+    }
+
+    // busy-aware: clear busy when interrupt is deactivated (EOI or DIR path)
+    if (int_id < Gicv3::INTID_SECURE) {
+        DPRINTF(GIC, "BUSY-- cpu=%p group=%d count=%u intid=%u\n", this, group, activeIrqCount[busyGroupIndex(group)], int_id);
+        markBusyOnDeactivate(group);
     }
 
     updateDistributor();

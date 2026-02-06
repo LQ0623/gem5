@@ -170,8 +170,7 @@ def create(args):
     if hasattr(system.realview.gic, "gicv4"):
         system.realview.gic.gicv4 = True
 
-    # system.realview.gic.enable_1ofn_busy = True
-    # system.realview.gic.enable_1ofn_rr = True
+    system.realview.gic.enable_1ofn_rr = True
 
     system.highest_el_is_64 = True
 

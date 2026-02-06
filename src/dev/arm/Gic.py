@@ -317,6 +317,10 @@ class Gicv3(BaseGic):
 
     gicv4 = Param.Bool(False, "GIC is GICv4 compatible")
 
+    enable_1ofn_rr = Param.Bool(False, "Using a polling algorithm")
+
+    enable_1ofn_busy = Param.Bool(False, "Use busy-active selection")
+
     reserved_is_res0 = Param.Bool(
         True,
         "According to the GIC specification (IHI0069) "

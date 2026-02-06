@@ -49,7 +49,7 @@ from m5.util import addToPath
 
 from gem5.simulate.exit_event import ExitEvent
 
-m5.util.addToPath("../..")
+m5.util.addToPath("../")
 
 import devices
 import workloads
@@ -169,9 +169,6 @@ def create(args):
     # Using GICv3
     if hasattr(system.realview.gic, "gicv4"):
         system.realview.gic.gicv4 = True
-
-    # system.realview.gic.enable_1ofn_busy = True
-    # system.realview.gic.enable_1ofn_rr = True
 
     system.highest_el_is_64 = True
 
