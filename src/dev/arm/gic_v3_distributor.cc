@@ -94,7 +94,12 @@ Gicv3Distributor::Gicv3Distributor(Gicv3 * gic, uint32_t it_lines)
       enable1ofNRR(gic->params().enable_1ofn_rr),
       enable1ofNBusyAware(gic->params().enable_1ofn_busy),
       rrCursor1ofN(-1), // <--- 初始化为 -1
-      lastRoutedCpu(it_lines, -1)
+      lastRoutedCpu(it_lines, -1),
+      Log_observation(gic->params().log_observation),
+      setspiWrites(0),
+      clrspiWrites(0),
+      badIntidWrites(0),
+      updateCalls(0)
 {
     panic_if(it_lines > Gicv3::INTID_SECURE, "Invalid value for it_lines!");
     /*
@@ -145,6 +150,10 @@ Gicv3Distributor::init()
 uint64_t
 Gicv3Distributor::read(Addr addr, size_t size, bool is_secure_access)
 {
+    if(Log_observation)
+        DPRINTF(GIC, "GICD MMIO write addr=%#lx size=%u\n",
+                    addr, size);
+
     if (GICD_IGROUPR.contains(addr)) { // Interrupt Group Registers
         uint64_t val = 0x0;
 
@@ -526,6 +535,10 @@ void
 Gicv3Distributor::write(Addr addr, uint64_t data, size_t size,
                         bool is_secure_access)
 {
+    if(Log_observation)
+        DPRINTF(GIC, "GICD MMIO write addr=%#lx data=%#lx size=%u\n",
+                    addr, data, size);
+    
     if (GICD_IGROUPR.contains(addr)) { // Interrupt Group Registers
         if (!DS && !is_secure_access) {
             // RAZ/WI for non-secure accesses
@@ -954,14 +967,40 @@ Gicv3Distributor::write(Addr addr, uint64_t data, size_t size,
         // * The value written specifies a Secure SPI, the value is
         // written by a Non-secure access, and the value of the
         // corresponding GICD_NSACR<n> register is 0.
-        const uint32_t intid = bits(data, 9, 0);
+        const uint32_t intid = bits(data, 12, 0);
+
+        // --- 采样修改前状态 ---
+        const bool beforePending  = (intid < irqPending.size()) ? irqPending[intid] : false;
+        const bool beforeIspendr  = (intid < irqPendingIspendr.size()) ? irqPendingIspendr[intid] : false;
+        const bool beforeEnabled  = (intid < irqEnabled.size()) ? irqEnabled[intid] : false;
+        const bool beforeActive   = (intid < irqActive.size()) ? irqActive[intid] : false;
+        const uint8_t beforePrio  = (intid < irqPriority.size()) ? irqPriority[intid] : 0;
+
+        DPRINTF(GIC,
+            "GICD_SETSPI_SR write data=%#x -> intid=%u | DS=%d isSPI=%d is_sec=%d | "
+            "pre: pend=%d ispendr=%d en=%d act=%d prio=%u\n",
+            data, intid, DS, !isNotSPI(intid), is_secure_access,
+            beforePending, beforeIspendr, beforeEnabled, beforeActive, beforePrio);
+
         if (isNotSPI(intid) || irqPending[intid] ||
             (nsAccessToSecInt(intid, is_secure_access) &&
              irqNsacr[intid] == 0)) {
+            // --- 打印 WI 原因 ---
+            DPRINTF(GIC,
+                "GICD_SETSPI_SR WI intid=%u reason: DS=%d isNotSPI=%d alreadyPend=%d is_sec=%d\n",
+                intid, DS, isNotSPI(intid), (intid < irqPending.size()) ? irqPending[intid] : -1,
+                is_secure_access);
             return;
         } else {
             // Valid SPI, set interrupt pending
             sendInt(intid);
+
+            // --- 采样修改后状态 ---
+            const bool afterPending = (intid < irqPending.size()) ? irqPending[intid] : false;
+            const bool afterIspendr = (intid < irqPendingIspendr.size()) ? irqPendingIspendr[intid] : false;
+            DPRINTF(GIC,
+                "GICD_SETSPI_SR ok intid=%u | post: pend=%d ispendr=%d (sendInt done)\n",
+                intid, afterPending, afterIspendr);
         }
         break;
       }
@@ -973,14 +1012,40 @@ Gicv3Distributor::write(Addr addr, uint64_t data, size_t size,
         // * The value written specifies a Secure SPI, the value is
         // written by a Non-secure access, and the value of the
         // corresponding GICD_NSACR<n> register is less than 0b10.
-        const uint32_t intid = bits(data, 9, 0);
+        const uint32_t intid = bits(data, 12, 0);
+
+        // --- 采样修改前状态 ---
+        const bool beforePending  = (intid < irqPending.size()) ? irqPending[intid] : false;
+        const bool beforeIspendr  = (intid < irqPendingIspendr.size()) ? irqPendingIspendr[intid] : false;
+        const bool beforeEnabled  = (intid < irqEnabled.size()) ? irqEnabled[intid] : false;
+        const bool beforeActive   = (intid < irqActive.size()) ? irqActive[intid] : false;
+        const uint8_t beforePrio  = (intid < irqPriority.size()) ? irqPriority[intid] : 0;
+
+        DPRINTF(GIC,
+            "GICD_CLRSPI_SR write data=%#x -> intid=%u | DS=%d isSPI=%d is_sec=%d | "
+            "pre: pend=%d ispendr=%d en=%d act=%d prio=%u\n",
+            data, intid, DS, !isNotSPI(intid), is_secure_access,
+            beforePending, beforeIspendr, beforeEnabled, beforeActive, beforePrio);
+
         if (isNotSPI(intid) || !irqPending[intid] ||
             (nsAccessToSecInt(intid, is_secure_access) &&
              irqNsacr[intid] < 2)) {
+            // --- 打印 WI 原因 ---
+            DPRINTF(GIC,
+                "GICD_CLRSPI_SR WI intid=%u reason: DS=%d isNotSPI=%d notPend=%d is_sec=%d\n",
+                intid, DS, isNotSPI(intid), (intid < irqPending.size()) ? !irqPending[intid] : -1,
+                is_secure_access);
             return;
         } else {
             // Valid SPI, clear interrupt pending
             deassertSPI(intid);
+
+            // --- 采样修改后状态 ---
+            const bool afterPending = (intid < irqPending.size()) ? irqPending[intid] : false;
+            const bool afterIspendr = (intid < irqPendingIspendr.size()) ? irqPendingIspendr[intid] : false;
+            DPRINTF(GIC,
+                "GICD_CLRSPI_SR ok intid=%u | post: pend=%d ispendr=%d (deassertSPI done)\n",
+                intid, afterPending, afterIspendr);
         }
         break;
       }
@@ -991,7 +1056,7 @@ Gicv3Distributor::write(Addr addr, uint64_t data, size_t size,
         // * The value written specifies an invalid SPI.
         // * The SPI is already pending.
         // * The value is written by a Non-secure access.
-        const uint32_t intid = bits(data, 9, 0);
+        const uint32_t intid = bits(data, 12, 0);
         if (DS || isNotSPI(intid) || irqPending[intid] || !is_secure_access) {
             return;
         } else {
@@ -1007,7 +1072,7 @@ Gicv3Distributor::write(Addr addr, uint64_t data, size_t size,
         // * The value written specifies an invalid SPI.
         // * The SPI is not pending.
         // * The value is written by a Non-secure access.
-        const uint32_t intid = bits(data, 9, 0);
+        const uint32_t intid = bits(data, 12, 0);
         if (DS || isNotSPI(intid) || !irqPending[intid] || !is_secure_access) {
             return;
         } else {
@@ -1026,6 +1091,7 @@ Gicv3Distributor::write(Addr addr, uint64_t data, size_t size,
 void
 Gicv3Distributor::sendInt(uint32_t int_id)
 {
+    badIntidWrites++;
     panic_if(int_id < Gicv3::SGI_MAX + Gicv3::PPI_MAX, "Invalid SPI!");
     panic_if(int_id > itLines, "Invalid SPI!");
     irqPending[int_id] = true;
@@ -1033,6 +1099,10 @@ Gicv3Distributor::sendInt(uint32_t int_id)
     DPRINTF(GIC, "Gicv3Distributor::sendInt(): "
             "int_id %d (SPI) pending bit set\n", int_id);
     update();
+
+    setspiWrites++;
+    // 到不了结尾就说明这个中断写入是错误的
+    badIntidWrites--;
 }
 
 void
@@ -1042,6 +1112,7 @@ Gicv3Distributor::clearInt(uint32_t int_id)
     // writes GICD_ICPENDR, GICD_CLRSPI_* or activates them via ICC_IAR
     if (isLevelSensitive(int_id)) {
         deassertSPI(int_id);
+        clrspiWrites++;
     }
 }
 
@@ -1054,6 +1125,11 @@ Gicv3Distributor::deassertSPI(uint32_t int_id)
     clearIrqCpuInterface(int_id);
 
     update();
+
+    if (int_id >= 32) {
+    DPRINTF(GIC, "sendInt: intid=%u pend=%d ispendr=%d\n",
+            int_id, irqPending[int_id], irqPendingIspendr[int_id]);
+}
 }
 
 Gicv3CPUInterface*
@@ -1195,6 +1271,12 @@ Gicv3Distributor::clearIrqCpuInterface(uint32_t int_id)
 void
 Gicv3Distributor::update()
 {
+    int target_id;
+    Gicv3::GroupId target_group;
+    updateCalls++;
+
+    DPRINTF(GIC, "DIST update() begin\n");
+    
     if (gic->blockIntUpdate())
         return;
 
@@ -1223,6 +1305,12 @@ Gicv3Distributor::update()
             }
         }
     }
+
+    // 在你“确认某个 intid 被选为最高优先级”那一刻打印：
+    DPRINTF(GIC, "DIST select intid=%u prio=%u group=%u targetCpu=%d\n",
+            target_id, irqPriority[target_id], target_group, lastRoutedCpu[target_id]); // 若没有 lastRoutedCpu，就打印 route() 得到的 idx
+
+    DPRINTF(GIC, "DIST update() end\n");
 
     // Update all redistributors
     for (int i = 0; i < gic->getSystem()->threads.size(); i++) {

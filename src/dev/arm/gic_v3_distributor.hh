@@ -283,6 +283,11 @@ class Gicv3Distributor : public Serializable
     uint32_t rrCursor1ofN = -1;
     std::vector<int> lastRoutedCpu; // size = numInterrupts, init -1
 
+    bool Log_observation;
+
+    uint64_t setspiWrites = 0, clrspiWrites = 0, badIntidWrites = 0, updateCalls = 0;
+
+
 };
 
 } // namespace gem5

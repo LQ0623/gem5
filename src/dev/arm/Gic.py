@@ -321,6 +321,10 @@ class Gicv3(BaseGic):
 
     enable_1ofn_busy = Param.Bool(False, "Use busy-active selection")
 
+    log_observation = Param.Bool(
+        False, "Log GICD MMIO read/write for observation"
+    )
+
     reserved_is_res0 = Param.Bool(
         True,
         "According to the GIC specification (IHI0069) "
