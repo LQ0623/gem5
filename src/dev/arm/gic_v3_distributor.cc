@@ -1274,8 +1274,6 @@ Gicv3Distributor::clearIrqCpuInterface(uint32_t int_id)
 void
 Gicv3Distributor::update()
 {
-    int target_id;
-    Gicv3::GroupId target_group;
     updateCalls++;
 
     DPRINTF(GIC, "DIST update() begin\n");
@@ -1308,10 +1306,6 @@ Gicv3Distributor::update()
             }
         }
     }
-
-    // 在你“确认某个 intid 被选为最高优先级”那一刻打印：
-    DPRINTF(GIC, "DIST select intid=%u prio=%u group=%u targetCpu=%d\n",
-            target_id, irqPriority[target_id], target_group, lastRoutedCpu[target_id]); // 若没有 lastRoutedCpu，就打印 route() 得到的 idx
 
     DPRINTF(GIC, "DIST update() end\n");
 

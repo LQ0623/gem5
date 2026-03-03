@@ -991,7 +991,7 @@ Gicv3Its::setGIC(Gicv3 *_gic)
     gic = _gic;
 
     // Advertise v4-capable virtualization features on GIC-700 style systems.
-    if (gic->params().gicv4) {
+    if (gic->gicv4Enabled()) {
         gitsTyper.vmovp = 1;
         gitsTyper._virtual = 1;
         gitsTyper.physical = 1;

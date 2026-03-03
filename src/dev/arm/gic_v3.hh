@@ -220,6 +220,12 @@ class Gicv3 : public BaseGic, public Gicv3Registers
 
     void update();
 
+    inline bool
+    gicv4Enabled() const
+    {
+        return params().gicv4;
+    }
+
   protected: // GIC state transfer
     void copyGicState(Gicv3Registers* from, Gicv3Registers* to);
 
