@@ -1,23 +1,44 @@
 CROSS_COMPILE ?= aarch64-none-elf-
 
-CC      := $(CROSS_COMPILE)gcc
-LD      := $(CROSS_COMPILE)ld
-OBJCOPY := $(CROSS_COMPILE)objcopy
+CC      = $(CROSS_COMPILE)gcc
+LD      = $(CROSS_COMPILE)ld
+OBJCOPY = $(CROSS_COMPILE)objcopy
 
-CFLAGS  := -O2 -ffreestanding -nostdlib -Wall -Wextra -mcpu=cortex-a57
+# Use generic ARMv8-A flags to avoid host-specific -mcpu parsing issues.
+CFLAGS  := -O2 -ffreestanding -nostdlib -Wall -Wextra -march=armv8-a
 LDFLAGS := -T link.ld
 
 TARGET  := vlpi_baremetal
 OBJS    := start.o vlpi_baremetal.o
 
-.PHONY: all clean run-direct run-trap
+CC_MACHINE := $(shell $(CC) -dumpmachine 2>/dev/null)
 
-all: $(TARGET).elf $(TARGET).bin
+.PHONY: all clean run-direct run-trap check-toolchain
 
-start.o: start.S
+all: check-toolchain $(TARGET).elf $(TARGET).bin
+
+check-toolchain:
+	@if [ -z "$(CC_MACHINE)" ]; then \
+		echo "ERROR: compiler '$(CC)' not found."; \
+		echo "Hint: install AArch64 cross toolchain and run:"; \
+		echo "  make CROSS_COMPILE=aarch64-none-elf-"; \
+		echo "or"; \
+		echo "  make CROSS_COMPILE=aarch64-linux-gnu-"; \
+		exit 1; \
+	fi
+	@if ! echo "$(CC_MACHINE)" | grep -q 'aarch64'; then \
+		echo "ERROR: CC='$(CC)' targets '$(CC_MACHINE)', not AArch64."; \
+		echo "Please use an AArch64 cross compiler, e.g.:"; \
+		echo "  make CROSS_COMPILE=aarch64-none-elf-"; \
+		echo "or"; \
+		echo "  make CROSS_COMPILE=aarch64-linux-gnu-"; \
+		exit 1; \
+	fi
+
+start.o: start.S check-toolchain
 	$(CC) $(CFLAGS) -c $< -o $@
 
-vlpi_baremetal.o: vlpi_baremetal.c
+vlpi_baremetal.o: vlpi_baremetal.c check-toolchain
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(TARGET).elf: $(OBJS) link.ld
