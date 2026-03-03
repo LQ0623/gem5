@@ -291,6 +291,11 @@ class Gicv3Its : public BasicPioDevice
         Bitfield<0> valid;
     EndBitUnion(CTE)
 
+    BitUnion64(VPETE)
+        Bitfield<40, 1> rdBase;
+        Bitfield<0> valid;
+    EndBitUnion(VPETE)
+
     enum InterruptType
     {
         VIRTUAL_INTERRUPT = 0,
@@ -336,6 +341,7 @@ class Gicv3Its : public BasicPioDevice
 
     bool pendingCommands;
     uint32_t pendingTranslations;
+    bool directVlpi;
 };
 
 /**
@@ -359,6 +365,7 @@ class ItsProcess : public Packet::SenderState
     using DTE = Gicv3Its::DTE;
     using ITTE = Gicv3Its::ITTE;
     using CTE = Gicv3Its::CTE;
+    using VPETE = Gicv3Its::VPETE;
     using Coroutine = gem5::Coroutine<PacketPtr, ItsAction>;
     using Yield = Coroutine::CallerType;
 
@@ -390,6 +397,9 @@ class ItsProcess : public Packet::SenderState
 
     uint64_t readIrqCollectionTable(Yield &yield, uint32_t collection_id);
 
+    void writeVpeTable(Yield &yield, uint32_t vpe_id, VPETE vpete);
+    uint64_t readVpeTable(Yield &yield, uint32_t vpe_id);
+
     void doRead(Yield &yield, Addr addr, void *ptr, size_t size);
     void doWrite(Yield &yield, Addr addr, void *ptr, size_t size);
     void terminate(Yield &yield);
@@ -416,7 +426,13 @@ class ItsTranslation : public ItsProcess
   protected:
     void main(Yield &yield) override;
 
-    std::pair<uint32_t, Gicv3Redistributor *>
+    struct TranslationResult
+    {
+        ITTE itte;
+        Gicv3Redistributor *redist;
+    };
+
+    TranslationResult
     translateLPI(Yield &yield, uint32_t device_id, uint32_t event_id);
 };
 

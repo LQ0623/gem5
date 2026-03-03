@@ -920,10 +920,33 @@ Gicv3Redistributor::readEntryLPI(uint32_t lpi_id)
     return lpi_pending_entry;
 }
 
+uint8_t
+Gicv3Redistributor::readEntryVLPI(uint32_t lpi_id)
+{
+    Addr lpi_pending_entry_ptr = vLpiPendingTablePtr + (lpi_id / 8);
+
+    uint8_t lpi_pending_entry;
+    memProxy->readBlob(lpi_pending_entry_ptr,
+                       &lpi_pending_entry,
+                       sizeof(lpi_pending_entry));
+
+    return lpi_pending_entry;
+}
+
 void
 Gicv3Redistributor::writeEntryLPI(uint32_t lpi_id, uint8_t lpi_pending_entry)
 {
     Addr lpi_pending_entry_ptr = lpiPendingTablePtr + (lpi_id / 8);
+
+    memProxy->writeBlob(lpi_pending_entry_ptr,
+                        &lpi_pending_entry,
+                        sizeof(lpi_pending_entry));
+}
+
+void
+Gicv3Redistributor::writeEntryVLPI(uint32_t lpi_id, uint8_t lpi_pending_entry)
+{
+    Addr lpi_pending_entry_ptr = vLpiPendingTablePtr + (lpi_id / 8);
 
     memProxy->writeBlob(lpi_pending_entry_ptr,
                         &lpi_pending_entry,
@@ -988,6 +1011,44 @@ Gicv3Redistributor::setClrLPI(uint64_t data, bool set)
     }
 
     writeEntryLPI(lpi_id, lpi_pending_entry);
+
+    updateDistributor();
+}
+
+void
+Gicv3Redistributor::setClrVLPI(uint64_t data, bool set)
+{
+    if (!EnableLPIs || !vLpiPendingTablePtr) {
+        return;
+    }
+
+    uint32_t lpi_id = data & 0xffffffff;
+    uint32_t largest_lpi_id = 1 << (vLpiIDBits + 1);
+
+    if (lpi_id > largest_lpi_id) {
+        return;
+    }
+
+    uint8_t lpi_pending_entry = readEntryVLPI(lpi_id);
+
+    uint8_t lpi_pending_entry_bit_position = lpi_id % 8;
+    bool is_set = lpi_pending_entry & (1 << lpi_pending_entry_bit_position);
+
+    if (set) {
+        if (is_set) {
+            return;
+        }
+
+        lpi_pending_entry |= 1 << (lpi_pending_entry_bit_position);
+    } else {
+        if (!is_set) {
+            return;
+        }
+
+        lpi_pending_entry &= ~(1 << (lpi_pending_entry_bit_position));
+    }
+
+    writeEntryVLPI(lpi_id, lpi_pending_entry);
 
     updateDistributor();
 }

@@ -234,9 +234,12 @@ class Gicv3Redistributor : public Serializable
     Gicv3::GroupId getIntGroup(int int_id) const;
     Gicv3::IntStatus intStatus(uint32_t int_id) const;
     uint8_t readEntryLPI(uint32_t intid);
+    uint8_t readEntryVLPI(uint32_t intid);
     void writeEntryLPI(uint32_t intid, uint8_t lpi_entry);
+    void writeEntryVLPI(uint32_t intid, uint8_t lpi_entry);
     bool isPendingLPI(uint32_t intid);
     void setClrLPI(uint64_t data, bool set);
+    void setClrVLPI(uint64_t data, bool set);
     void sendSGI(uint32_t int_id, Gicv3::GroupId group, bool ns);
     void serialize(CheckpointOut & cp) const override;
     void unserialize(CheckpointIn & cp) override;

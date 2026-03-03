@@ -271,6 +271,10 @@ class Gicv3Its(BasicPioDevice):
     # Devbits [17:13] = 0b100011: ITS supports 23 DeviceID bits
     # ID_bits [12:8] = 0b11111: ITS supports 31 EventID bits
     gits_typer = Param.UInt64(0x30023F01, "GITS_TYPER RO value")
+    direct_vlpi = Param.Bool(
+        False,
+        "Enable direct vLPI injection (ITS writes vPE pending table)",
+    )
 
     def generateDeviceTree(self, state):
         node = self.generateBasicPioDeviceNode(
