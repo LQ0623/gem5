@@ -77,6 +77,9 @@ Gicv3Redistributor::Gicv3Redistributor(Gicv3 * gic, uint32_t cpu_id)
       lpiConfigurationTablePtr(0),
       lpiIDBits(0),
       lpiPendingTablePtr(0),
+      vLpiConfigurationTablePtr(0),
+      vLpiIDBits(0),
+      vLpiPendingTablePtr(0),
       addrRangeSize(gic->params().gicv4 ? 0x40000 : 0x20000)
 {
 }
@@ -159,15 +162,16 @@ Gicv3Redistributor::read(Addr addr, size_t size, bool is_secure_access)
            * a series of contiguous Redistributor pages)
            * DirectLPI        [3]     == 1
            * (direct injection of LPIs supported)
-           * VLPIS            [1]     == 0
-           * (virtual LPIs not supported)
+           * VLPIS            [1]     == 1
+           * (virtual LPIs supported)
            * PLPIS            [0]     == 1
            * (physical LPIs supported)
            */
           uint64_t affinity = getAffinity();
           int last = cpuId == (gic->getSystem()->threads.size() - 1);
+          uint64_t vlpis = gic->params().gicv4 ? (1 << 1) : 0;
           return (affinity << 32) | (1 << 24) | (cpuId << 8) |
-              (1 << 5) | (last << 4) | (1 << 3) | (1 << 0);
+              (1 << 5) | (last << 4) | (1 << 3) | vlpis | (1 << 0);
       }
 
       case GICR_WAKER: // Wake Register
@@ -375,6 +379,12 @@ Gicv3Redistributor::read(Addr addr, size_t size, bool is_secure_access)
       // Redistributor Synchronize Register
       case GICR_SYNCR:
         return 0;
+
+      case GICR_VPROPBASER:
+        return vLpiConfigurationTablePtr | vLpiIDBits;
+
+      case GICR_VPENDBASER:
+        return vLpiPendingTablePtr;
 
       default:
         gic->reserved("Gicv3Redistributor::read(): invalid offset %#x\n", addr);
@@ -691,6 +701,19 @@ Gicv3Redistributor::write(Addr addr, uint64_t data, size_t size,
         // InnerCache, bits [9:7]
         //   000 Device-nGnRnE
         lpiPendingTablePtr = data & 0xFFFFFFFFF0000;
+        break;
+
+      case GICR_VPROPBASER: {
+          vLpiConfigurationTablePtr = data & 0xFFFFFFFFFF000;
+          vLpiIDBits = data & 0x1f;
+          if (vLpiIDBits > 0xf) {
+              vLpiIDBits = 0xf;
+          }
+          break;
+      }
+
+      case GICR_VPENDBASER:
+        vLpiPendingTablePtr = data & 0xFFFFFFFFF0000;
         break;
 
       case GICR_INVLPIR: { // Redistributor Invalidate LPI Register
@@ -1091,6 +1114,9 @@ Gicv3Redistributor::serialize(CheckpointOut & cp) const
     SERIALIZE_SCALAR(lpiConfigurationTablePtr);
     SERIALIZE_SCALAR(lpiIDBits);
     SERIALIZE_SCALAR(lpiPendingTablePtr);
+    SERIALIZE_SCALAR(vLpiConfigurationTablePtr);
+    SERIALIZE_SCALAR(vLpiIDBits);
+    SERIALIZE_SCALAR(vLpiPendingTablePtr);
 }
 
 void
@@ -1113,6 +1139,9 @@ Gicv3Redistributor::unserialize(CheckpointIn & cp)
     UNSERIALIZE_SCALAR(lpiConfigurationTablePtr);
     UNSERIALIZE_SCALAR(lpiIDBits);
     UNSERIALIZE_SCALAR(lpiPendingTablePtr);
+    UNSERIALIZE_SCALAR(vLpiConfigurationTablePtr);
+    UNSERIALIZE_SCALAR(vLpiIDBits);
+    UNSERIALIZE_SCALAR(vLpiPendingTablePtr);
 }
 
 } // namespace gem5

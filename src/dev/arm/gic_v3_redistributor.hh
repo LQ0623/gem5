@@ -70,10 +70,12 @@ class Gicv3Redistributor : public Serializable
 
     /*
      * GICv3 defines 2 contiguous 64KB frames for each redistributor.
-     * Order of frames must be RD_base, SGI_base.
+     * GICv4 defines 4 contiguous 64KB frames for each redistributor.
+     * Order of frames must be RD_base, SGI_base, VLPI_base, Reserved.
      */
     static const uint32_t RD_base  = 0x0;
     static const uint32_t SGI_base = 0x10000;
+    static const uint32_t VLPI_base = 0x20000;
 
     enum
     {
@@ -156,6 +158,15 @@ class Gicv3Redistributor : public Serializable
         GICR_SYNCR = RD_base + 0x00C0,
     };
 
+    // GIC virtual LPI Redistributor register (GICv4)
+    enum
+    {
+        // Redistributor Virtual Properties Base Address Register
+        GICR_VPROPBASER = VLPI_base + 0x0070,
+        // Redistributor Virtual Pending Table Base Address Register
+        GICR_VPENDBASER = VLPI_base + 0x0078,
+    };
+
     std::vector <uint8_t> irqGroup;
     std::vector <bool> irqEnabled;
     std::vector <bool> irqPending;
@@ -174,6 +185,10 @@ class Gicv3Redistributor : public Serializable
     Addr lpiConfigurationTablePtr;
     uint8_t lpiIDBits;
     Addr lpiPendingTablePtr;
+
+    Addr vLpiConfigurationTablePtr;
+    uint8_t vLpiIDBits;
+    Addr vLpiPendingTablePtr;
 
     BitUnion8(LPIConfigurationTableEntry)
         Bitfield<7, 2> priority;
