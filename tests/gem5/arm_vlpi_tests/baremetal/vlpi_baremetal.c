@@ -38,7 +38,7 @@
 
 #define ICC_PMR_EL1_INIT 0xffu
 
-#define DEVICE_ID 1u
+#define DEVICE_ID 0u
 #define EVENT_ID  8192u
 #define VPE_ID    0u
 #define PINTID    8192u

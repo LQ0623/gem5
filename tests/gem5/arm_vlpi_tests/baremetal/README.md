@@ -45,3 +45,6 @@ make run-trap
 3. 由裸机写 ITS 命令队列：`MAPD/VMAPP/VMAPTI/SYNC`。
 4. 写 `GITS_TRANSLATER` 触发事件。
 5. 进入 IRQ handler，读取 `ICC_IAR1_EL1`，打印 INTID/latency，写 `ICC_EOIR1_EL1`。
+
+> 注意：裸机通过 CPU 直接写 `GITS_TRANSLATER`，请求中没有 MSI StreamID。
+> 当前实现会回退使用 `device_id=0`，因此程序里 `DEVICE_ID` 固定为 `0`。

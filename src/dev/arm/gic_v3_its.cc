@@ -267,7 +267,16 @@ ItsTranslation::main(Yield &yield)
 {
     PacketPtr pkt = yield.get();
 
-    const uint32_t device_id = pkt->req->streamId();
+    uint32_t device_id = 0;
+    if (pkt->req->hasStreamId()) {
+        device_id = pkt->req->streamId();
+    } else {
+        // Some software-driven tests write GITS_TRANSLATER from the CPU side,
+        // which does not carry a PCI/MSI stream ID in the Request object.
+        // Fall back to device_id 0 instead of asserting.
+        warn_once("ITS translation request without StreamID; using device_id=0");
+    }
+
     const uint32_t event_id = pkt->getLE<uint32_t>();
 
     auto result = translateLPI(yield, device_id, event_id);
