@@ -432,26 +432,40 @@ Gicv3CPUInterface::readMiscReg(int misc_reg)
       // Virtual Interrupt Acknowledge Register 0
       case MISCREG_ICV_IAR0_EL1: {
           int lr_idx = getHPPVILR();
-          uint32_t int_id = Gicv3::INTID_SPURIOUS;
+          uint8_t lr_prio = 0xff;
+          bool lr_group1 = false;
+          bool lr_can_preempt = false;
 
           if (lr_idx >= 0) {
               ICH_LR_EL2 ich_lr_el2 =
                   isa->readMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx);
-
-              if (!ich_lr_el2.Group && hppviCanPreempt(lr_idx)) {
-                  int_id = ich_lr_el2.vINTID;
-
-                  if (int_id < Gicv3::INTID_SECURE ||
-                      int_id > Gicv3::INTID_SPURIOUS) {
-                      virtualActivateIRQ(lr_idx);
-                  } else {
-                      ich_lr_el2.State = ICH_LR_EL2_STATE_INVALID;
-                      isa->setMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx,
-                                              ich_lr_el2);
-                  }
-              }
+              lr_prio = ich_lr_el2.Priority;
+              lr_group1 = ich_lr_el2.Group;
+              lr_can_preempt = hppviCanPreempt(lr_idx);
           }
 
+          const bool direct_valid = hppviDirectCanPreempt();
+          uint8_t direct_prio = direct_valid ? hppvi_direct.prio : 0xff;
+
+          // 中文说明：跨组做全局优先级比较，IAR0 仅返回 Group0 中断。
+          bool lr_is_highest = lr_can_preempt && (lr_prio < direct_prio);
+
+          uint32_t int_id = Gicv3::INTID_SPURIOUS;
+
+          if (lr_is_highest && !lr_group1) {
+              ICH_LR_EL2 ich_lr_el2 =
+                  isa->readMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx);
+              int_id = ich_lr_el2.vINTID;
+
+              if (int_id < Gicv3::INTID_SECURE ||
+                  int_id > Gicv3::INTID_SPURIOUS) {
+                  virtualActivateIRQ(lr_idx);
+              } else {
+                  ich_lr_el2.State = ICH_LR_EL2_STATE_INVALID;
+                  isa->setMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx,
+                                          ich_lr_el2);
+              }
+          }
           value = int_id;
           virtualUpdate();
           break;
@@ -485,28 +499,30 @@ Gicv3CPUInterface::readMiscReg(int misc_reg)
       // Virtual Interrupt Acknowledge Register 1
       case MISCREG_ICV_IAR1_EL1: {
           int lr_idx = getHPPVILR();
-          uint32_t int_id = Gicv3::INTID_SPURIOUS;
-          bool lr_valid = false;
           uint8_t lr_prio = 0xff;
+          bool lr_group1 = false;
+          bool lr_can_preempt = false;
 
           if (lr_idx >= 0) {
               ICH_LR_EL2 ich_lr_el2 =
                   isa->readMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx);
-
-              if (ich_lr_el2.Group && hppviCanPreempt(lr_idx)) {
-                  lr_valid = true;
-                  lr_prio = ich_lr_el2.Priority;
-              }
+              lr_prio = ich_lr_el2.Priority;
+              lr_group1 = ich_lr_el2.Group;
+              lr_can_preempt = hppviCanPreempt(lr_idx);
           }
 
           const bool direct_valid = hppviDirectCanPreempt();
-          const bool direct_wins = direct_valid &&
-                                   (!lr_valid || hppvi_direct.prio <= lr_prio);
-          if (direct_wins) {
+          uint8_t direct_prio = direct_valid ? hppvi_direct.prio : 0xff;
+
+          bool direct_is_highest = direct_valid && (direct_prio <= lr_prio);
+          bool lr_is_highest = lr_can_preempt && (lr_prio < direct_prio);
+
+          uint32_t int_id = Gicv3::INTID_SPURIOUS;
+
+          if (direct_is_highest) {
               int_id = hppvi_direct.intid;
 
-              // 中文说明：直注入路径读取 IAR1 时，需把优先级压入 AP1R，
-              // 否则会发生同优先级虚拟中断重复抢占。
+              // 中文说明：直注入中断需入 AP1R，防止同优先级重入。
               uint8_t prio = hppvi_direct.prio & 0xf8;
               int apr_bit = prio >> (8 - VIRTUAL_PREEMPTION_BITS);
               int reg_no = apr_bit / 32;
@@ -516,12 +532,15 @@ Gicv3CPUInterface::readMiscReg(int misc_reg)
               apr |= (1 << reg_bit);
               isa->setMiscRegNoEffect(apr_idx, apr);
 
-              redistributor->setClrVLPI(hppvi_direct.intid,
-                                        redistributor->residentVpeId,
-                                        0, false);
+              // 中文说明：必须先本地清空槽位，避免 setClrVLPI 触发重扫后被覆盖。
+              uint32_t clr_intid = hppvi_direct.intid;
               hppvi_direct.intid = Gicv3::INTID_SPURIOUS;
               hppvi_direct.prio = 0xff;
-          } else if (lr_valid) {
+
+              redistributor->setClrVLPI(clr_intid,
+                                        redistributor->residentVpeId,
+                                        0, false);
+          } else if (lr_is_highest && lr_group1) {
               ICH_LR_EL2 ich_lr_el2 =
                   isa->readMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx);
               int_id = ich_lr_el2.vINTID;
@@ -535,7 +554,6 @@ Gicv3CPUInterface::readMiscReg(int misc_reg)
                                           ich_lr_el2);
               }
           }
-
           value = int_id;
           virtualUpdate();
           break;
@@ -954,16 +972,13 @@ Gicv3CPUInterface::setMiscReg(int misc_reg, RegVal val)
               return;
           }
 
-          if (int_id >= Gicv3Redistributor::SMALLEST_LPI_ID) {
-              virtualUpdate();
-              break; // 直注中断不在 LR 里，直接返回
-          }
-
           int lr_idx = virtualFindActive(int_id);
 
           if (lr_idx < 0) {
-              // No matching LR found
-              virtualIncrementEOICount();
+              // 中文说明：直注 vLPI 不在 LR 中属于合法行为。
+              if (int_id < Gicv3Redistributor::SMALLEST_LPI_ID) {
+                  virtualIncrementEOICount();
+              }
           } else {
               ICH_LR_EL2 ich_lr_el2 =
                   isa->readMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx);
@@ -1079,16 +1094,12 @@ Gicv3CPUInterface::setMiscReg(int misc_reg, RegVal val)
               return;
           }
 
-          if (int_id >= Gicv3Redistributor::SMALLEST_LPI_ID) {
-              virtualUpdate();
-              break;
-          }
-
           int lr_idx = virtualFindActive(int_id);
 
           if (lr_idx < 0) {
-              // No matching LR found
-              virtualIncrementEOICount();
+              if (int_id < Gicv3Redistributor::SMALLEST_LPI_ID) {
+                  virtualIncrementEOICount();
+              }
           } else {
               virtualDeactivateIRQ(lr_idx);
           }
@@ -2284,7 +2295,13 @@ Gicv3CPUInterface::hppviDirectCanPreempt() const
         return false;
     }
 
-    uint8_t vpmr = bits(isa->readMiscRegNoEffect(MISCREG_ICH_VMCR_EL2), 31, 24);
+    ICH_VMCR_EL2 ich_vmcr_el2 =
+        isa->readMiscRegNoEffect(MISCREG_ICH_VMCR_EL2);
+    if (!ich_vmcr_el2.VENG1) {
+        return false;
+    }
+
+    uint8_t vpmr = bits(ich_vmcr_el2, 31, 24);
     if (hppvi_direct.prio >= vpmr) {
         return false;
     }
@@ -2661,6 +2678,7 @@ Gicv3CPUInterface::clearPendingInterrupts()
 {
     gic->deassertAll(cpuId);
     resetHppi(hppi.intid);
+    resetHppi(hppvi_direct.intid);
 }
 
 void

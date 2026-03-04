@@ -963,6 +963,7 @@ Gicv3Redistributor::update()
         }
     } else {
         cpuInterface->update();
+        cpuInterface->virtualUpdate();
     }
 }
 
@@ -1123,8 +1124,8 @@ Gicv3Redistributor::setClrVLPI(uint32_t vintid, uint32_t vpeid,
 
     memProxy->writeBlob(entry_ptr, &entry, sizeof(entry));
 
-    // 中文说明：仅驻留并置位时刷新仲裁；非驻留只更新内存镜像。
-    if (is_resident && set) {
+    // 中文说明：仅驻留时刷新仲裁；非驻留只更新内存镜像。
+    if (is_resident) {
         updateDistributor();
     }
 }
