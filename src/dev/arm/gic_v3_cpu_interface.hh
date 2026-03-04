@@ -331,6 +331,7 @@ class Gicv3CPUInterface : public ArmISA::BaseISADevice, public Serializable
     uint8_t highestActivePriority() const;
     bool hppiCanPreempt();
     bool hppviCanPreempt(int lrIdx) const;
+    bool hppviDirectCanPreempt() const;
     bool inSecureState() const;
     ArmISA::InterruptTypes intSignalType(Gicv3::GroupId group) const;
     bool isAA64() const;

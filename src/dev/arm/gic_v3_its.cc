@@ -226,23 +226,24 @@ void
 ItsProcess::writeVpeTable(Yield &yield, uint32_t vpe_id, VPETE vpete)
 {
     const Addr base = its.pageAddress(Gicv3Its::VPE_TABLE);
-    const Addr address = base + (vpe_id * sizeof(VPETE));
+    const Addr address = base + (vpe_id * sizeof(vpete));
 
-    doWrite(yield, address, &vpete, sizeof(VPETE));
+    doWrite(yield, address, &vpete, sizeof(vpete));
 
     DPRINTF(ITS,
             "Writing VPETE at address %#x: rdBase=%#x vptAddr=%#x valid=%u\n",
-            address, vpete.rdBase, vpete.vptAddr, vpete.valid);
+            address, (uint64_t)vpete.rdBase,
+            (uint64_t)vpete.vptAddr, (uint64_t)vpete.valid);
 }
 
 ItsProcess::VPETE
 ItsProcess::readVpeTable(Yield &yield, uint32_t vpe_id)
 {
-    VPETE vpete{};
+    VPETE vpete = 0;
     const Addr base = its.pageAddress(Gicv3Its::VPE_TABLE);
-    const Addr address = base + (vpe_id * sizeof(VPETE));
+    const Addr address = base + (vpe_id * sizeof(vpete));
 
-    doRead(yield, address, &vpete, sizeof(VPETE));
+    doRead(yield, address, &vpete, sizeof(vpete));
 
     DPRINTF(ITS,
             "Reading VPETE at address %#x: rdBase=%#x vptAddr=%#x valid=%u\n",
@@ -478,16 +479,31 @@ ItsCommand::clear(Yield &yield, CommandEntry &command)
         terminate(yield);
     }
 
-    const auto collection_id = itte.icid;
-    CTE cte = readIrqCollectionTable(yield, collection_id);
+    if (itte.intType == Gicv3Its::VIRTUAL_INTERRUPT) {
+        VPETE vpete = readVpeTable(yield, itte.vpeid);
+        if (!vpete.valid) {
+            its.incrementReadPointer();
+            terminate(yield);
+        }
 
-    if (!cte.valid) {
-        its.incrementReadPointer();
-        terminate(yield);
+        auto *rd = its.getRedistributor(vpete.rdBase);
+        if (its.directVlpi) {
+            rd->setClrVLPI(itte.intNum, itte.vpeid, vpete.vptAddr, false);
+        } else {
+            rd->setClrLPI(itte.intNumHyp, false);
+        }
+    } else {
+        const auto collection_id = itte.icid;
+        CTE cte = readIrqCollectionTable(yield, collection_id);
+
+        if (!cte.valid) {
+            its.incrementReadPointer();
+            terminate(yield);
+        }
+
+        // Clear the LPI in the redistributor
+        its.getRedistributor(cte)->setClrLPI(itte.intNum, false);
     }
-
-    // Clear the LPI in the redistributor
-    its.getRedistributor(cte)->setClrLPI(itte.intNum, false);
 }
 
 void
@@ -513,15 +529,30 @@ ItsCommand::discard(Yield &yield, CommandEntry &command)
         terminate(yield);
     }
 
-    const auto collection_id = itte.icid;
-    Gicv3Its::CTE cte = readIrqCollectionTable(yield, collection_id);
+    if (itte.intType == Gicv3Its::VIRTUAL_INTERRUPT) {
+        VPETE vpete = readVpeTable(yield, itte.vpeid);
+        if (!vpete.valid) {
+            its.incrementReadPointer();
+            terminate(yield);
+        }
 
-    if (!cte.valid) {
-        its.incrementReadPointer();
-        terminate(yield);
+        auto *rd = its.getRedistributor(vpete.rdBase);
+        if (its.directVlpi) {
+            rd->setClrVLPI(itte.intNum, itte.vpeid, vpete.vptAddr, false);
+        } else {
+            rd->setClrLPI(itte.intNumHyp, false);
+        }
+    } else {
+        const auto collection_id = itte.icid;
+        CTE cte = readIrqCollectionTable(yield, collection_id);
+
+        if (!cte.valid) {
+            its.incrementReadPointer();
+            terminate(yield);
+        }
+
+        its.getRedistributor(cte)->setClrLPI(itte.intNum, false);
     }
-
-    its.getRedistributor(cte)->setClrLPI(itte.intNum, false);
 
     // Then removes the mapping from the ITT (invalidating)
     itte.valid = 0;
@@ -553,9 +584,10 @@ ItsCommand::doInt(Yield &yield, CommandEntry &command)
     }
 
     Gicv3Redistributor *redist = nullptr;
+    VPETE vpete = 0;
 
     if (itte.intType == Gicv3Its::VIRTUAL_INTERRUPT) {
-        VPETE vpete = readVpeTable(yield, itte.vpeid);
+        vpete = readVpeTable(yield, itte.vpeid);
 
         if (!vpete.valid) {
             its.incrementReadPointer();
@@ -609,15 +641,25 @@ ItsCommand::inv(Yield &yield, CommandEntry &command)
         terminate(yield);
     }
 
-    const auto collection_id = itte.icid;
-    CTE cte = readIrqCollectionTable(yield, collection_id);
+    if (itte.intType == Gicv3Its::VIRTUAL_INTERRUPT) {
+        VPETE vpete = readVpeTable(yield, itte.vpeid);
+        if (!vpete.valid) {
+            its.incrementReadPointer();
+            terminate(yield);
+        }
+        // 暂无虚拟缓存模型，命令语义为 no-op。
+        (void)vpete;
+    } else {
+        const auto collection_id = itte.icid;
+        CTE cte = readIrqCollectionTable(yield, collection_id);
 
-    if (!cte.valid) {
-        its.incrementReadPointer();
-        terminate(yield);
+        if (!cte.valid) {
+            its.incrementReadPointer();
+            terminate(yield);
+        }
+        // Do nothing since caching is currently not supported in
+        // Redistributor
     }
-    // Do nothing since caching is currently not supported in
-    // Redistributor
 }
 
 void
@@ -871,7 +913,7 @@ ItsCommand::vmapp(Yield &yield, CommandEntry &command)
     const uint64_t vpt_addr = bits(command.raw[3], 51, 16);
     const bool valid = bits(command.raw[3], 63);
 
-    VPETE vpete{};
+    VPETE vpete = 0;
     vpete.valid = valid;
     vpete.rdBase = rd_base;
     vpete.vptAddr = vpt_addr;

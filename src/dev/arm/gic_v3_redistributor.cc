@@ -856,53 +856,57 @@ Gicv3Redistributor::update()
 
     // Check LPIs
     if (EnableLPIs) {
-
         const uint32_t largest_lpi_id = 1 << (lpiIDBits + 1);
-        const uint32_t number_lpis = largest_lpi_id - SMALLEST_LPI_ID + 1;
-        const size_t table_size = largest_lpi_id / 8;
-        auto lpi_pending_table = std::make_unique<uint8_t[]>(table_size);
-        auto lpi_config_table = std::make_unique<uint8_t[]>(number_lpis);
 
-        memProxy->readBlob(lpiPendingTablePtr,
-                           lpi_pending_table.get(),
-                           table_size);
+        // 中文说明：避免 largest_lpi_id 小于最小 LPI 编号时发生无符号下溢。
+        if (largest_lpi_id >= SMALLEST_LPI_ID) {
+            const uint32_t number_lpis =
+                largest_lpi_id - SMALLEST_LPI_ID + 1;
+            const size_t table_size = largest_lpi_id / 8;
+            auto lpi_pending_table = std::make_unique<uint8_t[]>(table_size);
+            auto lpi_config_table = std::make_unique<uint8_t[]>(number_lpis);
 
-        memProxy->readBlob(lpiConfigurationTablePtr,
-                           lpi_config_table.get(),
-                           number_lpis);
+            memProxy->readBlob(lpiPendingTablePtr,
+                               lpi_pending_table.get(),
+                               table_size);
 
-        for (int lpi_id = SMALLEST_LPI_ID; lpi_id < largest_lpi_id;
-             lpi_id++) {
-            uint32_t lpi_pending_entry_byte = lpi_id / 8;
-            uint8_t lpi_pending_entry_bit_position = lpi_id % 8;
-            bool lpi_is_pending = lpi_pending_table[lpi_pending_entry_byte] &
-                                  1 << lpi_pending_entry_bit_position;
-            uint32_t lpi_configuration_entry_index = lpi_id - SMALLEST_LPI_ID;
+            memProxy->readBlob(lpiConfigurationTablePtr,
+                               lpi_config_table.get(),
+                               number_lpis);
 
-            LPIConfigurationTableEntry config_entry =
-                lpi_config_table[lpi_configuration_entry_index];
+            for (int lpi_id = SMALLEST_LPI_ID; lpi_id < largest_lpi_id;
+                 lpi_id++) {
+                uint32_t lpi_pending_entry_byte = lpi_id / 8;
+                uint8_t lpi_pending_entry_bit_position = lpi_id % 8;
+                bool lpi_is_pending = lpi_pending_table[lpi_pending_entry_byte] &
+                                      (1 << lpi_pending_entry_bit_position);
+                uint32_t lpi_configuration_entry_index =
+                    lpi_id - SMALLEST_LPI_ID;
 
-            bool lpi_is_enable = config_entry.enable;
+                LPIConfigurationTableEntry config_entry =
+                    lpi_config_table[lpi_configuration_entry_index];
 
-            // LPIs are always Non-secure Group 1 interrupts,
-            // in a system where two Security states are enabled.
-            Gicv3::GroupId lpi_group = Gicv3::G1NS;
-            bool group_enabled = distributor->groupEnabled(lpi_group);
+                bool lpi_is_enable = config_entry.enable;
 
-            if (lpi_is_pending && lpi_is_enable && group_enabled) {
-                uint8_t lpi_priority = config_entry.priority << 2;
+                // LPIs are always Non-secure Group 1 interrupts,
+                // in a system where two Security states are enabled.
+                Gicv3::GroupId lpi_group = Gicv3::G1NS;
+                bool group_enabled = distributor->groupEnabled(lpi_group);
 
-                if ((lpi_priority < cpuInterface->hppi.prio) ||
-                    (lpi_priority == cpuInterface->hppi.prio &&
-                     lpi_id < cpuInterface->hppi.intid)) {
-                    cpuInterface->hppi.intid = lpi_id;
-                    cpuInterface->hppi.prio = lpi_priority;
-                    cpuInterface->hppi.group = lpi_group;
+                if (lpi_is_pending && lpi_is_enable && group_enabled) {
+                    uint8_t lpi_priority = config_entry.priority << 2;
+
+                    if ((lpi_priority < cpuInterface->hppi.prio) ||
+                        (lpi_priority == cpuInterface->hppi.prio &&
+                         lpi_id < cpuInterface->hppi.intid)) {
+                        cpuInterface->hppi.intid = lpi_id;
+                        cpuInterface->hppi.prio = lpi_priority;
+                        cpuInterface->hppi.group = lpi_group;
+                    }
                 }
             }
         }
     }
-
 
     // 中文说明：当 vPE 驻留时，扫描 vLPI pending/config 并生成直注入候选。
     cpuInterface->hppvi_direct.intid = Gicv3::INTID_SPURIOUS;
@@ -912,36 +916,41 @@ Gicv3Redistributor::update()
     if (EnableLPIs && vpeResident && vLpiPendingTablePtr &&
         vLpiConfigurationTablePtr) {
         const uint32_t largest_vlpi_id = 1 << (vLpiIDBits + 1);
-        const uint32_t number_vlpis = largest_vlpi_id - SMALLEST_LPI_ID + 1;
-        const size_t table_size = largest_vlpi_id / 8;
-        auto vlpi_pending_table = std::make_unique<uint8_t[]>(table_size);
-        auto vlpi_config_table = std::make_unique<uint8_t[]>(number_vlpis);
 
-        memProxy->readBlob(vLpiPendingTablePtr,
-                           vlpi_pending_table.get(), table_size);
-        memProxy->readBlob(vLpiConfigurationTablePtr,
-                           vlpi_config_table.get(), number_vlpis);
+        // 中文说明：同样保护 vLPI 表规模计算，避免下溢导致超大分配。
+        if (largest_vlpi_id >= SMALLEST_LPI_ID) {
+            const uint32_t number_vlpis =
+                largest_vlpi_id - SMALLEST_LPI_ID + 1;
+            const size_t table_size = largest_vlpi_id / 8;
+            auto vlpi_pending_table = std::make_unique<uint8_t[]>(table_size);
+            auto vlpi_config_table = std::make_unique<uint8_t[]>(number_vlpis);
 
-        for (uint32_t lpi_id = SMALLEST_LPI_ID;
-             lpi_id < largest_vlpi_id; lpi_id++) {
-            uint32_t pending_byte = lpi_id / 8;
-            uint8_t pending_bit = lpi_id % 8;
-            bool is_pending =
-                vlpi_pending_table[pending_byte] & (1 << pending_bit);
-            uint32_t cfg_idx = lpi_id - SMALLEST_LPI_ID;
-            LPIConfigurationTableEntry config_entry =
-                vlpi_config_table[cfg_idx];
-            bool is_enable = config_entry.enable;
-            bool group_enabled = distributor->groupEnabled(Gicv3::G1NS);
+            memProxy->readBlob(vLpiPendingTablePtr,
+                               vlpi_pending_table.get(), table_size);
+            memProxy->readBlob(vLpiConfigurationTablePtr,
+                               vlpi_config_table.get(), number_vlpis);
 
-            if (is_pending && is_enable && group_enabled) {
-                uint8_t prio = config_entry.priority << 2;
-                if ((prio < cpuInterface->hppvi_direct.prio) ||
-                    (prio == cpuInterface->hppvi_direct.prio &&
-                     lpi_id < cpuInterface->hppvi_direct.intid)) {
-                    cpuInterface->hppvi_direct.intid = lpi_id;
-                    cpuInterface->hppvi_direct.prio = prio;
-                    cpuInterface->hppvi_direct.group = Gicv3::G1NS;
+            for (uint32_t lpi_id = SMALLEST_LPI_ID;
+                 lpi_id < largest_vlpi_id; lpi_id++) {
+                uint32_t pending_byte = lpi_id / 8;
+                uint8_t pending_bit = lpi_id % 8;
+                bool is_pending =
+                    vlpi_pending_table[pending_byte] & (1 << pending_bit);
+                uint32_t cfg_idx = lpi_id - SMALLEST_LPI_ID;
+                LPIConfigurationTableEntry config_entry =
+                    vlpi_config_table[cfg_idx];
+                bool is_enable = config_entry.enable;
+                bool group_enabled = distributor->groupEnabled(Gicv3::G1NS);
+
+                if (is_pending && is_enable && group_enabled) {
+                    uint8_t prio = config_entry.priority << 2;
+                    if ((prio < cpuInterface->hppvi_direct.prio) ||
+                        (prio == cpuInterface->hppvi_direct.prio &&
+                         lpi_id < cpuInterface->hppvi_direct.intid)) {
+                        cpuInterface->hppvi_direct.intid = lpi_id;
+                        cpuInterface->hppvi_direct.prio = prio;
+                        cpuInterface->hppvi_direct.group = Gicv3::G1NS;
+                    }
                 }
             }
         }

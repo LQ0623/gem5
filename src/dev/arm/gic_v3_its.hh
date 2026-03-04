@@ -291,14 +291,13 @@ class Gicv3Its : public BasicPioDevice
         Bitfield<0> valid;
     EndBitUnion(CTE)
 
-    // 中文说明：vPE 表项需要同时携带 Redistributor 路由信息和 vPT 基址，
-    // 64-bit 位域不足以容纳两个 64-bit 地址字段，因此改为普通结构体。
-    struct VPETE
-    {
-        uint64_t rdBase;
-        uint64_t vptAddr;
-        bool valid;
-    };
+    // 中文说明：VPETE 必须保持 64bit（8 字节）大小，和 BASER entrySize 对齐。
+    // 这里使用压缩位域，避免普通 struct 因对齐变成 24 字节导致越界写表。
+    BitUnion64(VPETE)
+        Bitfield<63> valid;
+        Bitfield<51, 16> vptAddr; // 36-bit 页基址字段
+        Bitfield<15, 0> rdBase;   // 16-bit RD 路由字段
+    EndBitUnion(VPETE)
 
     enum InterruptType
     {
