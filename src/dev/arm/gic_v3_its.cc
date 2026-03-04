@@ -222,6 +222,35 @@ ItsProcess::readIrqCollectionTable(Yield &yield, uint32_t collection_id)
     return cte;
 }
 
+void
+ItsProcess::writeVpeTable(Yield &yield, uint32_t vpe_id, VPETE vpete)
+{
+    const Addr base = its.pageAddress(Gicv3Its::VPE_TABLE);
+    const Addr address = base + (vpe_id * sizeof(vpete));
+
+    doWrite(yield, address, &vpete, sizeof(vpete));
+
+    DPRINTF(ITS,
+            "Writing VPETE at address %#x: rdBase=%#x vptAddr=%#x valid=%u\n",
+            address, (uint64_t)vpete.rdBase,
+            (uint64_t)vpete.vptAddr, (uint64_t)vpete.valid);
+}
+
+ItsProcess::VPETE
+ItsProcess::readVpeTable(Yield &yield, uint32_t vpe_id)
+{
+    VPETE vpete = 0;
+    const Addr base = its.pageAddress(Gicv3Its::VPE_TABLE);
+    const Addr address = base + (vpe_id * sizeof(vpete));
+
+    doRead(yield, address, &vpete, sizeof(vpete));
+
+    DPRINTF(ITS,
+            "Reading VPETE at address %#x: rdBase=%#x vptAddr=%#x valid=%u\n",
+            address, vpete.rdBase, vpete.vptAddr, vpete.valid);
+    return vpete;
+}
+
 ItsTranslation::ItsTranslation(Gicv3Its &_its)
   : ItsProcess(_its)
 {
@@ -243,16 +272,38 @@ ItsTranslation::main(Yield &yield)
 {
     PacketPtr pkt = yield.get();
 
-    const uint32_t device_id = pkt->req->streamId();
+    uint32_t device_id = 0;
+    if (pkt->req->hasStreamId()) {
+        device_id = pkt->req->streamId();
+    } else {
+        // Some software-driven tests write GITS_TRANSLATER from the CPU side,
+        // which does not carry a PCI/MSI stream ID in the Request object.
+        // Fall back to device_id 0 instead of asserting.
+        warn_once("ITS translation request without StreamID; using device_id=0");
+    }
+
     const uint32_t event_id = pkt->getLE<uint32_t>();
 
     auto result = translateLPI(yield, device_id, event_id);
 
-    uint32_t intid = result.first;
-    Gicv3Redistributor *redist = result.second;
+    const ITTE &itte = result.itte;
+    Gicv3Redistributor *redist = result.redist;
 
-    // Set the LPI in the redistributor
-    redist->setClrLPI(intid, true);
+    if (itte.intType == Gicv3Its::VIRTUAL_INTERRUPT) {
+        if (its.directVlpi) {
+            // Direct injection path: write to the guest vPE pending table.
+            DPRINTF(ITS, "vLPI direct inject vINTID=%u\n", itte.intNum);
+            redist->setClrVLPI(itte.intNum, result.vpeid, result.vptAddr, true);
+        } else {
+            // Trap-based path: inject pINTID to EL2, so SW can reflect to EL1.
+            DPRINTF(ITS, "vLPI trap inject pINTID=%u for vINTID=%u\n",
+                    itte.intNumHyp, itte.intNum);
+            redist->setClrLPI(itte.intNumHyp, true);
+        }
+    } else {
+        // Set the physical LPI in the redistributor.
+        redist->setClrLPI(itte.intNum, true);
+    }
 
     // Update the value in GITS_TRANSLATER only once we know
     // there was no error in the tranlation process (before
@@ -262,7 +313,7 @@ ItsTranslation::main(Yield &yield)
     terminate(yield);
 }
 
-std::pair<uint32_t, Gicv3Redistributor *>
+ItsTranslation::TranslationResult
 ItsTranslation::translateLPI(Yield &yield, uint32_t device_id,
                              uint32_t event_id)
 {
@@ -279,7 +330,21 @@ ItsTranslation::translateLPI(Yield &yield, uint32_t device_id,
     ITTE itte = readIrqTranslationTable(yield, dte.ittAddress, event_id);
     const auto collection_id = itte.icid;
 
-    if (!itte.valid || its.collectionOutOfRange(collection_id)) {
+    if (!itte.valid) {
+        terminate(yield);
+    }
+
+    if (itte.intType == Gicv3Its::VIRTUAL_INTERRUPT) {
+        VPETE vpete = readVpeTable(yield, itte.vpeid);
+
+        if (!vpete.valid) {
+            terminate(yield);
+        }
+
+        return TranslationResult{itte, its.getRedistributor(vpete.rdBase), vpete.vptAddr, itte.vpeid};
+    }
+
+    if (its.collectionOutOfRange(collection_id)) {
         terminate(yield);
     }
 
@@ -289,8 +354,8 @@ ItsTranslation::translateLPI(Yield &yield, uint32_t device_id,
         terminate(yield);
     }
 
-    // Returning the INTID and the target Redistributor
-    return std::make_pair(itte.intNum, its.getRedistributor(cte));
+    // Return the translated ITTE and target Redistributor.
+    return TranslationResult{itte, its.getRedistributor(cte), 0, 0};
 }
 
 ItsCommand::DispatchTable ItsCommand::cmdDispatcher =
@@ -414,16 +479,31 @@ ItsCommand::clear(Yield &yield, CommandEntry &command)
         terminate(yield);
     }
 
-    const auto collection_id = itte.icid;
-    CTE cte = readIrqCollectionTable(yield, collection_id);
+    if (itte.intType == Gicv3Its::VIRTUAL_INTERRUPT) {
+        VPETE vpete = readVpeTable(yield, itte.vpeid);
+        if (!vpete.valid) {
+            its.incrementReadPointer();
+            terminate(yield);
+        }
 
-    if (!cte.valid) {
-        its.incrementReadPointer();
-        terminate(yield);
+        auto *rd = its.getRedistributor(vpete.rdBase);
+        if (its.directVlpi) {
+            rd->setClrVLPI(itte.intNum, itte.vpeid, vpete.vptAddr, false);
+        } else {
+            rd->setClrLPI(itte.intNumHyp, false);
+        }
+    } else {
+        const auto collection_id = itte.icid;
+        CTE cte = readIrqCollectionTable(yield, collection_id);
+
+        if (!cte.valid) {
+            its.incrementReadPointer();
+            terminate(yield);
+        }
+
+        // Clear the LPI in the redistributor
+        its.getRedistributor(cte)->setClrLPI(itte.intNum, false);
     }
-
-    // Clear the LPI in the redistributor
-    its.getRedistributor(cte)->setClrLPI(itte.intNum, false);
 }
 
 void
@@ -449,15 +529,30 @@ ItsCommand::discard(Yield &yield, CommandEntry &command)
         terminate(yield);
     }
 
-    const auto collection_id = itte.icid;
-    Gicv3Its::CTE cte = readIrqCollectionTable(yield, collection_id);
+    if (itte.intType == Gicv3Its::VIRTUAL_INTERRUPT) {
+        VPETE vpete = readVpeTable(yield, itte.vpeid);
+        if (!vpete.valid) {
+            its.incrementReadPointer();
+            terminate(yield);
+        }
 
-    if (!cte.valid) {
-        its.incrementReadPointer();
-        terminate(yield);
+        auto *rd = its.getRedistributor(vpete.rdBase);
+        if (its.directVlpi) {
+            rd->setClrVLPI(itte.intNum, itte.vpeid, vpete.vptAddr, false);
+        } else {
+            rd->setClrLPI(itte.intNumHyp, false);
+        }
+    } else {
+        const auto collection_id = itte.icid;
+        CTE cte = readIrqCollectionTable(yield, collection_id);
+
+        if (!cte.valid) {
+            its.incrementReadPointer();
+            terminate(yield);
+        }
+
+        its.getRedistributor(cte)->setClrLPI(itte.intNum, false);
     }
-
-    its.getRedistributor(cte)->setClrLPI(itte.intNum, false);
 
     // Then removes the mapping from the ITT (invalidating)
     itte.valid = 0;
@@ -488,16 +583,39 @@ ItsCommand::doInt(Yield &yield, CommandEntry &command)
         terminate(yield);
     }
 
-    const auto collection_id = itte.icid;
-    CTE cte = readIrqCollectionTable(yield, collection_id);
+    Gicv3Redistributor *redist = nullptr;
+    VPETE vpete = 0;
 
-    if (!cte.valid) {
-        its.incrementReadPointer();
-        terminate(yield);
+    if (itte.intType == Gicv3Its::VIRTUAL_INTERRUPT) {
+        vpete = readVpeTable(yield, itte.vpeid);
+
+        if (!vpete.valid) {
+            its.incrementReadPointer();
+            terminate(yield);
+        }
+
+        redist = its.getRedistributor(vpete.rdBase);
+    } else {
+        const auto collection_id = itte.icid;
+        CTE cte = readIrqCollectionTable(yield, collection_id);
+
+        if (!cte.valid) {
+            its.incrementReadPointer();
+            terminate(yield);
+        }
+
+        redist = its.getRedistributor(cte);
     }
 
-    // Set the LPI in the redistributor
-    its.getRedistributor(cte)->setClrLPI(itte.intNum, true);
+    if (itte.intType == Gicv3Its::VIRTUAL_INTERRUPT) {
+        if (its.directVlpi) {
+            redist->setClrVLPI(itte.intNum, itte.vpeid, vpete.vptAddr, true);
+        } else {
+            redist->setClrLPI(itte.intNumHyp, true);
+        }
+    } else {
+        redist->setClrLPI(itte.intNum, true);
+    }
 }
 
 void
@@ -523,15 +641,25 @@ ItsCommand::inv(Yield &yield, CommandEntry &command)
         terminate(yield);
     }
 
-    const auto collection_id = itte.icid;
-    CTE cte = readIrqCollectionTable(yield, collection_id);
+    if (itte.intType == Gicv3Its::VIRTUAL_INTERRUPT) {
+        VPETE vpete = readVpeTable(yield, itte.vpeid);
+        if (!vpete.valid) {
+            its.incrementReadPointer();
+            terminate(yield);
+        }
+        // 暂无虚拟缓存模型，命令语义为 no-op。
+        (void)vpete;
+    } else {
+        const auto collection_id = itte.icid;
+        CTE cte = readIrqCollectionTable(yield, collection_id);
 
-    if (!cte.valid) {
-        its.incrementReadPointer();
-        terminate(yield);
+        if (!cte.valid) {
+            its.incrementReadPointer();
+            terminate(yield);
+        }
+        // Do nothing since caching is currently not supported in
+        // Redistributor
     }
-    // Do nothing since caching is currently not supported in
-    // Redistributor
 }
 
 void
@@ -741,44 +869,139 @@ ItsCommand::sync(Yield &yield, CommandEntry &command)
 void
 ItsCommand::vinvall(Yield &yield, CommandEntry &command)
 {
-    panic("ITS %s command unimplemented", __func__);
+    if (collectionOutOfRange(command)) {
+        its.incrementReadPointer();
+        terminate(yield);
+    }
+
+    // No virtual interrupt cache modelled yet.
 }
 
 void
 ItsCommand::vmapi(Yield &yield, CommandEntry &command)
 {
-    panic("ITS %s command unimplemented", __func__);
+    if (deviceOutOfRange(command)) {
+        its.incrementReadPointer();
+        terminate(yield);
+    }
+
+    DTE dte = readDeviceTable(yield, command.deviceId);
+
+    if (!dte.valid || idOutOfRange(command, dte) ||
+        its.lpiOutOfRange(command.eventId)) {
+        its.incrementReadPointer();
+        terminate(yield);
+    }
+
+    ITTE itte = readIrqTranslationTable(yield, dte.ittAddress, command.eventId);
+
+    itte.valid = 1;
+    itte.intType = Gicv3Its::VIRTUAL_INTERRUPT;
+    itte.intNum = command.eventId;
+    itte.intNumHyp = bits(command.raw[1], 63, 32);
+    itte.vpeid = bits(command.raw[2], 15, 0);
+
+    writeIrqTranslationTable(yield, dte.ittAddress, command.eventId, itte);
 }
 
 void
 ItsCommand::vmapp(Yield &yield, CommandEntry &command)
 {
-    panic("ITS %s command unimplemented", __func__);
+    // 中文说明：按 IHI0069 重新解析 VMAPP 位域。
+    const uint32_t vpe_id = bits(command.raw[1], 15, 0);
+    const uint64_t rd_base = bits(command.raw[2], 50, 16);
+    const uint64_t vpt_addr = bits(command.raw[3], 51, 16);
+    const bool valid = bits(command.raw[3], 63);
+
+    VPETE vpete = 0;
+    vpete.valid = valid;
+    vpete.rdBase = rd_base;
+    vpete.vptAddr = vpt_addr;
+
+    writeVpeTable(yield, vpe_id, vpete);
 }
 
 void
 ItsCommand::vmapti(Yield &yield, CommandEntry &command)
 {
-    panic("ITS %s command unimplemented", __func__);
+    if (deviceOutOfRange(command)) {
+        its.incrementReadPointer();
+        terminate(yield);
+    }
+
+    DTE dte = readDeviceTable(yield, command.deviceId);
+
+    const uint32_t pintid = bits(command.raw[1], 63, 32);
+    const uint32_t vintid = bits(command.raw[2], 31, 0);
+    const uint32_t vpeid = bits(command.raw[2], 47, 32);
+
+    if (!dte.valid || idOutOfRange(command, dte) ||
+        its.lpiOutOfRange(vintid) || its.lpiOutOfRange(pintid)) {
+        its.incrementReadPointer();
+        terminate(yield);
+    }
+
+    ITTE itte = readIrqTranslationTable(yield, dte.ittAddress, command.eventId);
+
+    itte.valid = 1;
+    itte.intType = Gicv3Its::VIRTUAL_INTERRUPT;
+    itte.intNum = vintid;
+    itte.intNumHyp = pintid;
+    itte.vpeid = vpeid;
+
+    writeIrqTranslationTable(yield, dte.ittAddress, command.eventId, itte);
 }
 
 void
 ItsCommand::vmovi(Yield &yield, CommandEntry &command)
 {
-    panic("ITS %s command unimplemented", __func__);
+    if (deviceOutOfRange(command)) {
+        its.incrementReadPointer();
+        terminate(yield);
+    }
+
+    DTE dte = readDeviceTable(yield, command.deviceId);
+
+    if (!dte.valid || idOutOfRange(command, dte)) {
+        its.incrementReadPointer();
+        terminate(yield);
+    }
+
+    ITTE itte = readIrqTranslationTable(yield, dte.ittAddress, command.eventId);
+
+    if (!itte.valid || itte.intType != Gicv3Its::VIRTUAL_INTERRUPT) {
+        its.incrementReadPointer();
+        terminate(yield);
+    }
+
+    const auto new_vpe = bits(command.raw[2], 15, 0);
+    itte.vpeid = new_vpe;
+
+    writeIrqTranslationTable(yield, dte.ittAddress, command.eventId, itte);
 }
 
 void
 ItsCommand::vmovp(Yield &yield, CommandEntry &command)
 {
-    panic("ITS %s command unimplemented", __func__);
+    const uint64_t rd1 = bits(command.raw[2], 50, 16);
+    const uint64_t rd2 = bits(command.raw[3], 50, 16);
+
+    if (rd1 != rd2) {
+        Gicv3Redistributor * redist1 = its.getRedistributor(rd1);
+        Gicv3Redistributor * redist2 = its.getRedistributor(rd2);
+
+        its.moveAllPendingState(redist1, redist2);
+    }
 }
 
 void
 ItsCommand::vsync(Yield &yield, CommandEntry &command)
 {
-    panic("ITS %s command unimplemented", __func__);
+    (void)yield;
+    (void)command;
+    // No op while no virtual caching model is present.
 }
+
 
 Gicv3Its::Gicv3Its(const Gicv3ItsParams &params)
  : BasicPioDevice(params, params.pio_size),
@@ -792,25 +1015,42 @@ Gicv3Its::Gicv3Its(const Gicv3ItsParams &params)
    gic(nullptr),
    commandEvent([this] { checkCommandQueue(); }, name()),
    pendingCommands(false),
-   pendingTranslations(0)
+   pendingTranslations(0),
+   directVlpi(params.direct_vlpi)
 {
     BASER device_baser = 0;
     device_baser.type = DEVICE_TABLE;
     device_baser.entrySize = sizeof(uint64_t) - 1;
     tableBases[0] = device_baser;
 
+    BASER vpe_baser = 0;
+    vpe_baser.type = VPE_TABLE;
+    vpe_baser.entrySize = sizeof(uint64_t) - 1;
+    tableBases[1] = vpe_baser;
+
     BASER icollect_baser = 0;
     icollect_baser.type = COLLECTION_TABLE;
     icollect_baser.entrySize = sizeof(uint64_t) - 1;
-    tableBases[1] = icollect_baser;
+    tableBases[2] = icollect_baser;
 }
+
 
 void
 Gicv3Its::setGIC(Gicv3 *_gic)
 {
     assert(!gic);
     gic = _gic;
+
+    // Advertise v4-capable virtualization features on GIC-700 style systems.
+    if (gic->gicv4Enabled()) {
+        gitsTyper.vmovp = 1;
+        gitsTyper._virtual = 1;
+        gitsTyper.physical = 1;
+        gitsTyper.seis = 1;
+        gitsTyper.cct = 1;
+    }
 }
+
 
 AddrRangeList
 Gicv3Its::getAddrRanges() const
@@ -1048,6 +1288,8 @@ Gicv3Its::serialize(CheckpointOut & cp) const
     SERIALIZE_SCALAR(gitsCreadr);
     SERIALIZE_SCALAR(gitsCwriter);
     SERIALIZE_SCALAR(gitsIidr);
+    SERIALIZE_SCALAR(gitsTranslater);
+    SERIALIZE_SCALAR(directVlpi);
 
     SERIALIZE_CONTAINER(tableBases);
 }
@@ -1061,6 +1303,8 @@ Gicv3Its::unserialize(CheckpointIn & cp)
     UNSERIALIZE_SCALAR(gitsCreadr);
     UNSERIALIZE_SCALAR(gitsCwriter);
     UNSERIALIZE_SCALAR(gitsIidr);
+    UNSERIALIZE_SCALAR(gitsTranslater);
+    UNSERIALIZE_SCALAR(directVlpi);
 
     UNSERIALIZE_CONTAINER(tableBases);
 }

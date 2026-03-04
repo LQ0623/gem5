@@ -1,0 +1,4 @@
+boot...
+vLPI IRQ INTID=8193
+latency=123
+EOI done

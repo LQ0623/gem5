@@ -170,6 +170,8 @@ class Gicv3CPUInterface : public ArmISA::BaseISADevice, public Serializable
     };
 
     hppi_t hppi;
+    // 中文说明：直注入路径的虚拟最高优先级 pending 中断。
+    hppi_t hppvi_direct;
 
     // GIC CPU interface memory mapped control registers (legacy)
     enum
@@ -329,6 +331,7 @@ class Gicv3CPUInterface : public ArmISA::BaseISADevice, public Serializable
     uint8_t highestActivePriority() const;
     bool hppiCanPreempt();
     bool hppviCanPreempt(int lrIdx) const;
+    bool hppviDirectCanPreempt() const;
     bool inSecureState() const;
     ArmISA::InterruptTypes intSignalType(Gicv3::GroupId group) const;
     bool isAA64() const;
