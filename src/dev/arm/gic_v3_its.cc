@@ -226,23 +226,27 @@ void
 ItsProcess::writeVpeTable(Yield &yield, uint32_t vpe_id, VPETE vpete)
 {
     const Addr base = its.pageAddress(Gicv3Its::VPE_TABLE);
-    const Addr address = base + (vpe_id * sizeof(vpete));
+    const Addr address = base + (vpe_id * sizeof(VPETE));
 
-    doWrite(yield, address, &vpete, sizeof(vpete));
+    doWrite(yield, address, &vpete, sizeof(VPETE));
 
-    DPRINTF(ITS, "Writing VPETE at address %#x: %#x\n", address, vpete);
+    DPRINTF(ITS,
+            "Writing VPETE at address %#x: rdBase=%#x vptAddr=%#x valid=%u\n",
+            address, vpete.rdBase, vpete.vptAddr, vpete.valid);
 }
 
-uint64_t
+ItsProcess::VPETE
 ItsProcess::readVpeTable(Yield &yield, uint32_t vpe_id)
 {
-    uint64_t vpete;
+    VPETE vpete{};
     const Addr base = its.pageAddress(Gicv3Its::VPE_TABLE);
-    const Addr address = base + (vpe_id * sizeof(vpete));
+    const Addr address = base + (vpe_id * sizeof(VPETE));
 
-    doRead(yield, address, &vpete, sizeof(vpete));
+    doRead(yield, address, &vpete, sizeof(VPETE));
 
-    DPRINTF(ITS, "Reading VPETE at address %#x: %#x\n", address, vpete);
+    DPRINTF(ITS,
+            "Reading VPETE at address %#x: rdBase=%#x vptAddr=%#x valid=%u\n",
+            address, vpete.rdBase, vpete.vptAddr, vpete.valid);
     return vpete;
 }
 
@@ -288,7 +292,7 @@ ItsTranslation::main(Yield &yield)
         if (its.directVlpi) {
             // Direct injection path: write to the guest vPE pending table.
             DPRINTF(ITS, "vLPI direct inject vINTID=%u\n", itte.intNum);
-            redist->setClrVLPI(itte.intNum, true);
+            redist->setClrVLPI(itte.intNum, result.vpeid, result.vptAddr, true);
         } else {
             // Trap-based path: inject pINTID to EL2, so SW can reflect to EL1.
             DPRINTF(ITS, "vLPI trap inject pINTID=%u for vINTID=%u\n",
@@ -336,7 +340,7 @@ ItsTranslation::translateLPI(Yield &yield, uint32_t device_id,
             terminate(yield);
         }
 
-        return TranslationResult{itte, its.getRedistributor(vpete.rdBase)};
+        return TranslationResult{itte, its.getRedistributor(vpete.rdBase), vpete.vptAddr, itte.vpeid};
     }
 
     if (its.collectionOutOfRange(collection_id)) {
@@ -350,7 +354,7 @@ ItsTranslation::translateLPI(Yield &yield, uint32_t device_id,
     }
 
     // Return the translated ITTE and target Redistributor.
-    return TranslationResult{itte, its.getRedistributor(cte)};
+    return TranslationResult{itte, its.getRedistributor(cte), 0, 0};
 }
 
 ItsCommand::DispatchTable ItsCommand::cmdDispatcher =
@@ -573,7 +577,7 @@ ItsCommand::doInt(Yield &yield, CommandEntry &command)
 
     if (itte.intType == Gicv3Its::VIRTUAL_INTERRUPT) {
         if (its.directVlpi) {
-            redist->setClrVLPI(itte.intNum, true);
+            redist->setClrVLPI(itte.intNum, itte.vpeid, vpete.vptAddr, true);
         } else {
             redist->setClrLPI(itte.intNumHyp, true);
         }
@@ -861,22 +865,16 @@ ItsCommand::vmapi(Yield &yield, CommandEntry &command)
 void
 ItsCommand::vmapp(Yield &yield, CommandEntry &command)
 {
-    if (collectionOutOfRange(command)) {
-        its.incrementReadPointer();
-        terminate(yield);
-    }
+    // 中文说明：按 IHI0069 重新解析 VMAPP 位域。
+    const uint32_t vpe_id = bits(command.raw[1], 15, 0);
+    const uint64_t rd_base = bits(command.raw[2], 50, 16);
+    const uint64_t vpt_addr = bits(command.raw[3], 51, 16);
+    const bool valid = bits(command.raw[3], 63);
 
-    const auto vpe_id = bits(command.raw[2], 15, 0);
-    const auto valid = bits(command.raw[2], 63);
-    uint64_t rd_base = bits(command.raw[2], 50, 16);
-
-    if (!rd_base) {
-        rd_base = bits(command.raw[3], 50, 16);
-    }
-
-    VPETE vpete = 0;
+    VPETE vpete{};
     vpete.valid = valid;
     vpete.rdBase = rd_base;
+    vpete.vptAddr = vpt_addr;
 
     writeVpeTable(yield, vpe_id, vpete);
 }
@@ -891,10 +889,12 @@ ItsCommand::vmapti(Yield &yield, CommandEntry &command)
 
     DTE dte = readDeviceTable(yield, command.deviceId);
 
-    const auto pintid = bits(command.raw[1], 63, 32);
+    const uint32_t pintid = bits(command.raw[1], 63, 32);
+    const uint32_t vintid = bits(command.raw[2], 31, 0);
+    const uint32_t vpeid = bits(command.raw[2], 47, 32);
 
     if (!dte.valid || idOutOfRange(command, dte) ||
-        its.lpiOutOfRange(command.eventId) || its.lpiOutOfRange(pintid)) {
+        its.lpiOutOfRange(vintid) || its.lpiOutOfRange(pintid)) {
         its.incrementReadPointer();
         terminate(yield);
     }
@@ -903,9 +903,9 @@ ItsCommand::vmapti(Yield &yield, CommandEntry &command)
 
     itte.valid = 1;
     itte.intType = Gicv3Its::VIRTUAL_INTERRUPT;
-    itte.intNum = command.eventId;
+    itte.intNum = vintid;
     itte.intNumHyp = pintid;
-    itte.vpeid = bits(command.raw[2], 15, 0);
+    itte.vpeid = vpeid;
 
     writeIrqTranslationTable(yield, dte.ittAddress, command.eventId, itte);
 }

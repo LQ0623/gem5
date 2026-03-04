@@ -66,6 +66,9 @@ Gicv3CPUInterface::Gicv3CPUInterface(Gicv3 * gic, ThreadContext *_tc)
 {
     hppi.prio = 0xff;
     hppi.intid = Gicv3::INTID_SPURIOUS;
+    hppvi_direct.prio = 0xff;
+    hppvi_direct.intid = Gicv3::INTID_SPURIOUS;
+    hppvi_direct.group = Gicv3::G1NS;
 
     setISA(static_cast<ISA*>(tc->getIsaPtr()));
 }
@@ -82,6 +85,9 @@ Gicv3CPUInterface::resetHppi(uint32_t intid)
 {
     if (intid == hppi.intid)
         hppi.prio = 0xff;
+
+    if (intid == hppvi_direct.intid)
+        hppvi_direct.prio = 0xff;
 }
 
 void
@@ -425,25 +431,39 @@ Gicv3CPUInterface::readMiscReg(int misc_reg)
       case MISCREG_ICV_IAR0_EL1: {
           int lr_idx = getHPPVILR();
           uint32_t int_id = Gicv3::INTID_SPURIOUS;
+          bool lr_valid = false;
+          uint8_t lr_prio = 0xff;
 
           if (lr_idx >= 0) {
               ICH_LR_EL2 ich_lr_el2 =
                   isa->readMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx);
-
               if (!ich_lr_el2.Group && hppviCanPreempt(lr_idx)) {
-                  int_id = ich_lr_el2.vINTID;
+                  lr_valid = true;
+                  lr_prio = ich_lr_el2.Priority;
+              }
+          }
 
-                  if (int_id < Gicv3::INTID_SECURE ||
-                      int_id > Gicv3::INTID_SPURIOUS) {
-                      virtualActivateIRQ(lr_idx);
-                  } else {
-                      // Bogus... Pseudocode says:
-                      // - Move from pending to invalid...
-                      // - Return de bogus id...
-                      ich_lr_el2.State = ICH_LR_EL2_STATE_INVALID;
-                      isa->setMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx,
-                                              ich_lr_el2);
-                  }
+          const bool direct_wins = (hppvi_direct.prio != 0xff) &&
+                                   (!lr_valid || hppvi_direct.prio <= lr_prio);
+          if (direct_wins) {
+              int_id = hppvi_direct.intid;
+              redistributor->setClrVLPI(hppvi_direct.intid,
+                                        redistributor->residentVpeId,
+                                        0, false);
+              hppvi_direct.intid = Gicv3::INTID_SPURIOUS;
+              hppvi_direct.prio = 0xff;
+          } else if (lr_valid) {
+              ICH_LR_EL2 ich_lr_el2 =
+                  isa->readMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx);
+              int_id = ich_lr_el2.vINTID;
+
+              if (int_id < Gicv3::INTID_SECURE ||
+                  int_id > Gicv3::INTID_SPURIOUS) {
+                  virtualActivateIRQ(lr_idx);
+              } else {
+                  ich_lr_el2.State = ICH_LR_EL2_STATE_INVALID;
+                  isa->setMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx,
+                                          ich_lr_el2);
               }
           }
 
@@ -481,25 +501,40 @@ Gicv3CPUInterface::readMiscReg(int misc_reg)
       case MISCREG_ICV_IAR1_EL1: {
           int lr_idx = getHPPVILR();
           uint32_t int_id = Gicv3::INTID_SPURIOUS;
+          bool lr_valid = false;
+          uint8_t lr_prio = 0xff;
 
           if (lr_idx >= 0) {
               ICH_LR_EL2 ich_lr_el2 =
                   isa->readMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx);
 
               if (ich_lr_el2.Group && hppviCanPreempt(lr_idx)) {
-                  int_id = ich_lr_el2.vINTID;
+                  lr_valid = true;
+                  lr_prio = ich_lr_el2.Priority;
+              }
+          }
 
-                  if (int_id < Gicv3::INTID_SECURE ||
-                      int_id > Gicv3::INTID_SPURIOUS) {
-                      virtualActivateIRQ(lr_idx);
-                  } else {
-                      // Bogus... Pseudocode says:
-                      // - Move from pending to invalid...
-                      // - Return de bogus id...
-                      ich_lr_el2.State = ICH_LR_EL2_STATE_INVALID;
-                      isa->setMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx,
-                                              ich_lr_el2);
-                  }
+          const bool direct_wins = (hppvi_direct.prio != 0xff) &&
+                                   (!lr_valid || hppvi_direct.prio <= lr_prio);
+          if (direct_wins) {
+              int_id = hppvi_direct.intid;
+              redistributor->setClrVLPI(hppvi_direct.intid,
+                                        redistributor->residentVpeId,
+                                        0, false);
+              hppvi_direct.intid = Gicv3::INTID_SPURIOUS;
+              hppvi_direct.prio = 0xff;
+          } else if (lr_valid) {
+              ICH_LR_EL2 ich_lr_el2 =
+                  isa->readMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx);
+              int_id = ich_lr_el2.vINTID;
+
+              if (int_id < Gicv3::INTID_SECURE ||
+                  int_id > Gicv3::INTID_SPURIOUS) {
+                  virtualActivateIRQ(lr_idx);
+              } else {
+                  ich_lr_el2.State = ICH_LR_EL2_STATE_INVALID;
+                  isa->setMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx,
+                                          ich_lr_el2);
               }
           }
 
@@ -2090,18 +2125,34 @@ Gicv3CPUInterface::virtualUpdate()
 
     bool signal_IRQ = false;
     bool signal_FIQ = false;
+
+    // 中文说明：比较 LR 选出的 HPPVI 与直注入 hppvi_direct 的优先级。
     int lr_idx = getHPPVILR();
+    bool lr_valid = false;
+    uint8_t lr_prio = 0xff;
+    bool lr_group1 = true;
 
     if (lr_idx >= 0) {
         ICH_LR_EL2 ich_lr_el2 =
             isa->readMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx);
-
         if (hppviCanPreempt(lr_idx)) {
-            if (ich_lr_el2.Group) {
-                signal_IRQ = true;
-            } else {
-                signal_FIQ = true;
-            }
+            lr_valid = true;
+            lr_prio = ich_lr_el2.Priority;
+            lr_group1 = ich_lr_el2.Group;
+        }
+    }
+
+    const bool direct_valid = (hppvi_direct.prio != 0xff);
+    const bool direct_wins = direct_valid &&
+        (!lr_valid || hppvi_direct.prio <= lr_prio);
+
+    if (direct_wins) {
+        signal_IRQ = true;
+    } else if (lr_valid) {
+        if (lr_group1) {
+            signal_IRQ = true;
+        } else {
+            signal_FIQ = true;
         }
     }
 
@@ -2568,7 +2619,7 @@ Gicv3CPUInterface::bpr1(Gicv3::GroupId group)
 bool
 Gicv3CPUInterface::havePendingInterrupts() const
 {
-    return gic->haveAsserted(cpuId) || hppi.prio != 0xff;
+    return gic->haveAsserted(cpuId) || hppi.prio != 0xff || hppvi_direct.prio != 0xff;
 }
 
 void
@@ -2624,6 +2675,9 @@ Gicv3CPUInterface::serialize(CheckpointOut & cp) const
     SERIALIZE_SCALAR(hppi.intid);
     SERIALIZE_SCALAR(hppi.prio);
     SERIALIZE_ENUM(hppi.group);
+    SERIALIZE_SCALAR(hppvi_direct.intid);
+    SERIALIZE_SCALAR(hppvi_direct.prio);
+    SERIALIZE_ENUM(hppvi_direct.group);
 }
 
 void
@@ -2632,6 +2686,9 @@ Gicv3CPUInterface::unserialize(CheckpointIn & cp)
     UNSERIALIZE_SCALAR(hppi.intid);
     UNSERIALIZE_SCALAR(hppi.prio);
     UNSERIALIZE_ENUM(hppi.group);
+    UNSERIALIZE_SCALAR(hppvi_direct.intid);
+    UNSERIALIZE_SCALAR(hppvi_direct.prio);
+    UNSERIALIZE_ENUM(hppvi_direct.group);
 }
 
 } // namespace gem5

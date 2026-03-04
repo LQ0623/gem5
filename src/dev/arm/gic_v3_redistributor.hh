@@ -190,6 +190,10 @@ class Gicv3Redistributor : public Serializable
     uint8_t vLpiIDBits;
     Addr vLpiPendingTablePtr;
 
+    // 中文说明：记录当前 RD 上驻留的 vPE 状态。
+    bool vpeResident;
+    uint32_t residentVpeId;
+
     BitUnion8(LPIConfigurationTableEntry)
         Bitfield<7, 2> priority;
         Bitfield<1> res1;
@@ -239,7 +243,7 @@ class Gicv3Redistributor : public Serializable
     void writeEntryVLPI(uint32_t intid, uint8_t lpi_entry);
     bool isPendingLPI(uint32_t intid);
     void setClrLPI(uint64_t data, bool set);
-    void setClrVLPI(uint64_t data, bool set);
+    void setClrVLPI(uint32_t vintid, uint32_t vpeid, uint64_t vpt_addr, bool set);
     void sendSGI(uint32_t int_id, Gicv3::GroupId group, bool ns);
     void serialize(CheckpointOut & cp) const override;
     void unserialize(CheckpointIn & cp) override;

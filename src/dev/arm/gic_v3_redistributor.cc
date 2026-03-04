@@ -80,6 +80,8 @@ Gicv3Redistributor::Gicv3Redistributor(Gicv3 * gic, uint32_t cpu_id)
       vLpiConfigurationTablePtr(0),
       vLpiIDBits(0),
       vLpiPendingTablePtr(0),
+      vpeResident(false),
+      residentVpeId(0),
       addrRangeSize(gic->params().gicv4 ? 0x40000 : 0x20000)
 {
 }
@@ -713,7 +715,11 @@ Gicv3Redistributor::write(Addr addr, uint64_t data, size_t size,
       }
 
       case GICR_VPENDBASER:
-        vLpiPendingTablePtr = data & 0xFFFFFFFFF0000;
+        // 中文说明：解析驻留位和 vPEID，用于 direct vLPI 驻留裁决。
+        vLpiPendingTablePtr = data & 0xFFFFFFFFFF0000ULL;
+        vpeResident = (data & (1ULL << 63)) != 0;
+        residentVpeId = data & 0xFFFF;
+        updateDistributor();
         break;
 
       case GICR_INVLPIR: { // Redistributor Invalidate LPI Register
@@ -897,6 +903,50 @@ Gicv3Redistributor::update()
         }
     }
 
+
+    // 中文说明：当 vPE 驻留时，扫描 vLPI pending/config 并生成直注入候选。
+    cpuInterface->hppvi_direct.intid = Gicv3::INTID_SPURIOUS;
+    cpuInterface->hppvi_direct.prio = 0xff;
+    cpuInterface->hppvi_direct.group = Gicv3::G1NS;
+
+    if (EnableLPIs && vpeResident && vLpiPendingTablePtr &&
+        vLpiConfigurationTablePtr) {
+        const uint32_t largest_vlpi_id = 1 << (vLpiIDBits + 1);
+        const uint32_t number_vlpis = largest_vlpi_id - SMALLEST_LPI_ID + 1;
+        const size_t table_size = largest_vlpi_id / 8;
+        auto vlpi_pending_table = std::make_unique<uint8_t[]>(table_size);
+        auto vlpi_config_table = std::make_unique<uint8_t[]>(number_vlpis);
+
+        memProxy->readBlob(vLpiPendingTablePtr,
+                           vlpi_pending_table.get(), table_size);
+        memProxy->readBlob(vLpiConfigurationTablePtr,
+                           vlpi_config_table.get(), number_vlpis);
+
+        for (uint32_t lpi_id = SMALLEST_LPI_ID;
+             lpi_id < largest_vlpi_id; lpi_id++) {
+            uint32_t pending_byte = lpi_id / 8;
+            uint8_t pending_bit = lpi_id % 8;
+            bool is_pending =
+                vlpi_pending_table[pending_byte] & (1 << pending_bit);
+            uint32_t cfg_idx = lpi_id - SMALLEST_LPI_ID;
+            LPIConfigurationTableEntry config_entry =
+                vlpi_config_table[cfg_idx];
+            bool is_enable = config_entry.enable;
+            bool group_enabled = distributor->groupEnabled(Gicv3::G1NS);
+
+            if (is_pending && is_enable && group_enabled) {
+                uint8_t prio = config_entry.priority << 2;
+                if ((prio < cpuInterface->hppvi_direct.prio) ||
+                    (prio == cpuInterface->hppvi_direct.prio &&
+                     lpi_id < cpuInterface->hppvi_direct.intid)) {
+                    cpuInterface->hppvi_direct.intid = lpi_id;
+                    cpuInterface->hppvi_direct.prio = prio;
+                    cpuInterface->hppvi_direct.group = Gicv3::G1NS;
+                }
+            }
+        }
+    }
+
     if (peInLowPowerState) {
         if (cpuInterface->havePendingInterrupts()) {
             cpuInterface->assertWakeRequest();
@@ -1016,41 +1066,58 @@ Gicv3Redistributor::setClrLPI(uint64_t data, bool set)
 }
 
 void
-Gicv3Redistributor::setClrVLPI(uint64_t data, bool set)
+Gicv3Redistributor::setClrVLPI(uint32_t vintid, uint32_t vpeid,
+                               uint64_t vpt_addr, bool set)
 {
-    if (!EnableLPIs || !vLpiPendingTablePtr) {
+    if (!EnableLPIs) {
         return;
     }
 
-    uint32_t lpi_id = data & 0xffffffff;
-    uint32_t largest_lpi_id = 1 << (vLpiIDBits + 1);
+    const bool is_resident = (vpeResident && residentVpeId == vpeid);
+
+    Addr pending_base = 0;
+    if (is_resident) {
+        pending_base = vLpiPendingTablePtr;
+    } else {
+        pending_base = vpt_addr << 16;
+    }
+
+    if (!pending_base) {
+        return;
+    }
+
+    const uint32_t lpi_id = vintid;
+    const uint32_t largest_lpi_id = 1 << (vLpiIDBits + 1);
 
     if (lpi_id > largest_lpi_id) {
         return;
     }
 
-    uint8_t lpi_pending_entry = readEntryVLPI(lpi_id);
+    Addr entry_ptr = pending_base + (lpi_id / 8);
+    uint8_t entry = 0;
+    memProxy->readBlob(entry_ptr, &entry, sizeof(entry));
 
-    uint8_t lpi_pending_entry_bit_position = lpi_id % 8;
-    bool is_set = lpi_pending_entry & (1 << lpi_pending_entry_bit_position);
+    uint8_t bit_pos = lpi_id % 8;
+    bool is_set = entry & (1 << bit_pos);
 
     if (set) {
         if (is_set) {
             return;
         }
-
-        lpi_pending_entry |= 1 << (lpi_pending_entry_bit_position);
+        entry |= (1 << bit_pos);
     } else {
         if (!is_set) {
             return;
         }
-
-        lpi_pending_entry &= ~(1 << (lpi_pending_entry_bit_position));
+        entry &= ~(1 << bit_pos);
     }
 
-    writeEntryVLPI(lpi_id, lpi_pending_entry);
+    memProxy->writeBlob(entry_ptr, &entry, sizeof(entry));
 
-    updateDistributor();
+    // 中文说明：仅驻留并置位时刷新仲裁；非驻留只更新内存镜像。
+    if (is_resident && set) {
+        updateDistributor();
+    }
 }
 
 Gicv3::GroupId
@@ -1178,6 +1245,8 @@ Gicv3Redistributor::serialize(CheckpointOut & cp) const
     SERIALIZE_SCALAR(vLpiConfigurationTablePtr);
     SERIALIZE_SCALAR(vLpiIDBits);
     SERIALIZE_SCALAR(vLpiPendingTablePtr);
+    SERIALIZE_SCALAR(vpeResident);
+    SERIALIZE_SCALAR(residentVpeId);
 }
 
 void
@@ -1203,6 +1272,8 @@ Gicv3Redistributor::unserialize(CheckpointIn & cp)
     UNSERIALIZE_SCALAR(vLpiConfigurationTablePtr);
     UNSERIALIZE_SCALAR(vLpiIDBits);
     UNSERIALIZE_SCALAR(vLpiPendingTablePtr);
+    UNSERIALIZE_SCALAR(vpeResident);
+    UNSERIALIZE_SCALAR(residentVpeId);
 }
 
 } // namespace gem5

@@ -291,10 +291,14 @@ class Gicv3Its : public BasicPioDevice
         Bitfield<0> valid;
     EndBitUnion(CTE)
 
-    BitUnion64(VPETE)
-        Bitfield<40, 1> rdBase;
-        Bitfield<0> valid;
-    EndBitUnion(VPETE)
+    // 中文说明：vPE 表项需要同时携带 Redistributor 路由信息和 vPT 基址，
+    // 64-bit 位域不足以容纳两个 64-bit 地址字段，因此改为普通结构体。
+    struct VPETE
+    {
+        uint64_t rdBase;
+        uint64_t vptAddr;
+        bool valid;
+    };
 
     enum InterruptType
     {
@@ -398,7 +402,7 @@ class ItsProcess : public Packet::SenderState
     uint64_t readIrqCollectionTable(Yield &yield, uint32_t collection_id);
 
     void writeVpeTable(Yield &yield, uint32_t vpe_id, VPETE vpete);
-    uint64_t readVpeTable(Yield &yield, uint32_t vpe_id);
+    VPETE readVpeTable(Yield &yield, uint32_t vpe_id);
 
     void doRead(Yield &yield, Addr addr, void *ptr, size_t size);
     void doWrite(Yield &yield, Addr addr, void *ptr, size_t size);
@@ -430,6 +434,8 @@ class ItsTranslation : public ItsProcess
     {
         ITTE itte;
         Gicv3Redistributor *redist;
+        uint64_t vptAddr;
+        uint32_t vpeid;
     };
 
     TranslationResult

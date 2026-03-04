@@ -170,6 +170,8 @@ class Gicv3CPUInterface : public ArmISA::BaseISADevice, public Serializable
     };
 
     hppi_t hppi;
+    // 中文说明：直注入路径的虚拟最高优先级 pending 中断。
+    hppi_t hppvi_direct;
 
     // GIC CPU interface memory mapped control registers (legacy)
     enum
