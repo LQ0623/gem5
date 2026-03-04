@@ -53,3 +53,7 @@ make run-trap
 ## 结束条件
 
 `Makefile` 的 `run-direct/run-trap` 已加 `--exit-on-uart-eot`，程序在成功或超时时都会发送 UART EOT (`0x04`) 主动结束仿真，避免一直卡住到 `simulate() limit reached`。
+
+
+> 若你的 `system.terminal` 只停在 `[vlpi-baremetal-closed-loop] start`，通常是卡在早期等待（如 `GICR_WAKER.ChildrenAsleep`）或等待中断阶段。
+> 当前程序已改成“有限重试 + 超时打印 + EOT退出”，会输出 `WARN WAKER timeout` 或 `TIMEOUT waiting IRQ` 来定位卡点。

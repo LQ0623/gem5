@@ -116,6 +116,11 @@ static inline void isb(void)
     asm volatile("isb");
 }
 
+static inline void cpu_relax(void)
+{
+    asm volatile("nop");
+}
+
 static inline void uart_putc(char c)
 {
     *(volatile uint32_t *)(UART_BASE) = (uint32_t)c;
@@ -179,8 +184,16 @@ static void gic_enable_lpis(void)
 
     waker &= ~GICR_WAKER_ProcessorSleep;
     mmio_write32(GICR_WAKER, waker);
-    while (mmio_read32(GICR_WAKER) & GICR_WAKER_ChildrenAsleep)
-        ;
+
+    // Do not spin forever if platform keeps ChildrenAsleep asserted.
+    uint64_t waker_retry = 1000000ULL;
+    while ((mmio_read32(GICR_WAKER) & GICR_WAKER_ChildrenAsleep) &&
+           waker_retry--) {
+        cpu_relax();
+    }
+    if (!waker_retry) {
+        uart_puts("[vlpi-baremetal-closed-loop] WARN WAKER timeout\n");
+    }
 
     mmio_write32(GICD_CTLR, GICD_CTLR_ENABLE_GRP1NS);
 
@@ -279,19 +292,22 @@ int main(void)
     t_enter = read_cntpct();
     mmio_write32(GITS_TRANSLATER, EVENT_ID);
 
-    const uint64_t timeout_cycles = 50000000ULL;
-    while (last_intid == 0 && (read_cntpct() - t_enter) < timeout_cycles)
-        asm volatile("wfi");
+    // Software timeout loop: avoid WFI-only waits which may never wake in
+    // this minimal setup when no interrupt arrives.
+    uint64_t wait_retry = 200000000ULL;
+    while (last_intid == 0 && wait_retry--) {
+        cpu_relax();
+    }
 
     if (last_intid == 0) {
         uart_puts("[vlpi-baremetal-closed-loop] TIMEOUT waiting IRQ\n");
         signal_exit();
         for (;;)
-            asm volatile("wfi");
+            cpu_relax();
     }
 
     uart_puts("[vlpi-baremetal-closed-loop] done\n");
     signal_exit();
-    for (;;)
-        asm volatile("wfi");
+    for (;; )
+        cpu_relax();
 }
