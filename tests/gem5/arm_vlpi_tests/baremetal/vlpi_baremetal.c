@@ -127,6 +127,12 @@ static void uart_puts(const char *s)
         uart_putc(*s++);
 }
 
+static void signal_exit(void)
+{
+    // baremetal.py can terminate simulation on UART EOT (0x04).
+    uart_putc(0x04);
+}
+
 static void uart_put_u64(uint64_t x)
 {
     char buf[32];
@@ -273,10 +279,19 @@ int main(void)
     t_enter = read_cntpct();
     mmio_write32(GITS_TRANSLATER, EVENT_ID);
 
-    while (last_intid == 0)
+    const uint64_t timeout_cycles = 50000000ULL;
+    while (last_intid == 0 && (read_cntpct() - t_enter) < timeout_cycles)
         asm volatile("wfi");
 
+    if (last_intid == 0) {
+        uart_puts("[vlpi-baremetal-closed-loop] TIMEOUT waiting IRQ\n");
+        signal_exit();
+        for (;;)
+            asm volatile("wfi");
+    }
+
     uart_puts("[vlpi-baremetal-closed-loop] done\n");
+    signal_exit();
     for (;;)
         asm volatile("wfi");
 }

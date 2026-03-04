@@ -54,7 +54,8 @@ run-direct: all
 	  --kernel tests/gem5/arm_vlpi_tests/baremetal/$(TARGET).elf \
 	  --cpu atomic --num-cores 1 --machine-type VExpress_GEM5_V2 \
 	  --param "system.realview.gic.gicv4=True" \
-	  --param "system.realview.gic.its.direct_vlpi=True"
+	  --param "system.realview.gic.its.direct_vlpi=True" \
+	  --exit-on-uart-eot
 
 run-trap: all
 	build/ARM/gem5.opt \
@@ -63,7 +64,8 @@ run-trap: all
 	  --kernel tests/gem5/arm_vlpi_tests/baremetal/$(TARGET).elf \
 	  --cpu atomic --num-cores 1 --machine-type VExpress_GEM5_V2 \
 	  --param "system.realview.gic.gicv4=True" \
-	  --param "system.realview.gic.its.direct_vlpi=False"
+	  --param "system.realview.gic.its.direct_vlpi=False" \
+	  --exit-on-uart-eot
 
 clean:
 	rm -f $(OBJS) $(TARGET).elf $(TARGET).bin

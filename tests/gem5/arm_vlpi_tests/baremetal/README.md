@@ -48,3 +48,8 @@ make run-trap
 
 > 注意：裸机通过 CPU 直接写 `GITS_TRANSLATER`，请求中没有 MSI StreamID。
 > 当前实现会回退使用 `device_id=0`，因此程序里 `DEVICE_ID` 固定为 `0`。
+
+
+## 结束条件
+
+`Makefile` 的 `run-direct/run-trap` 已加 `--exit-on-uart-eot`，程序在成功或超时时都会发送 UART EOT (`0x04`) 主动结束仿真，避免一直卡住到 `simulate() limit reached`。
