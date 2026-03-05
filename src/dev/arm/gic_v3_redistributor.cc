@@ -922,10 +922,9 @@ Gicv3Redistributor::update()
 
         for (uint32_t sgi_id = 0; sgi_id < 16; sgi_id++) {
             bool is_pending = vsgi_pending[sgi_id / 8] & (1 << (sgi_id % 8));
-            bool group_enabled = distributor->groupEnabled(Gicv3::G1NS);
             LPIConfigurationTableEntry config_entry = vsgi_config[sgi_id];
 
-            if (is_pending && config_entry.enable && group_enabled) {
+            if (is_pending && config_entry.enable) {
                 uint8_t prio = config_entry.priority << 2; // Fetch real priority from Config Table
                 if ((prio < cpuInterface->hppvi_direct.prio) ||
                     (prio == cpuInterface->hppvi_direct.prio && sgi_id < cpuInterface->hppvi_direct.intid)) {
@@ -956,9 +955,8 @@ Gicv3Redistributor::update()
                 uint32_t cfg_idx = lpi_id - SMALLEST_LPI_ID;
                 LPIConfigurationTableEntry config_entry = vlpi_config_table[cfg_idx];
                 bool is_enable = config_entry.enable;
-                bool group_enabled = distributor->groupEnabled(Gicv3::G1NS);
 
-                if (is_pending && is_enable && group_enabled) {
+                if (is_pending && is_enable) {
                     uint8_t prio = config_entry.priority << 2;
                     if ((prio < cpuInterface->hppvi_direct.prio) ||
                         (prio == cpuInterface->hppvi_direct.prio && lpi_id < cpuInterface->hppvi_direct.intid)) {

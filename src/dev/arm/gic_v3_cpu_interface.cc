@@ -896,8 +896,12 @@ Gicv3CPUInterface::setMiscReg(int misc_reg, RegVal val)
           int lr_idx = virtualFindActive(int_id);
 
           if (lr_idx < 0) {
-              // No LR found matching
-              virtualIncrementEOICount();
+              ICH_HCR_EL2 ich_hcr = isa->readMiscRegNoEffect(MISCREG_ICH_HCR_EL2);
+              if (int_id < 16 && ich_hcr.TC == 0) {
+                  DPRINTF(GIC, "vSGI: Direct EOI on EOIR0 without LR (Guest Bug/Ignored).\n");
+              } else if (int_id < Gicv3Redistributor::SMALLEST_LPI_ID) {
+                  virtualIncrementEOICount();
+              }
           } else {
               ICH_LR_EL2 ich_lr_el2 =
                   isa->readMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx);
@@ -1452,9 +1456,20 @@ Gicv3CPUInterface::setMiscReg(int misc_reg, RegVal val)
 
       // Software Generated Interrupt Group 0 Register
       case MISCREG_ICC_SGI0R:
-      case MISCREG_ICC_SGI0R_EL1:
-        generateSGI(val, Gicv3::G0S);
-        break;
+      case MISCREG_ICC_SGI0R_EL1: {
+          bool hcr_fmo = getHCREL2FMO();
+          if ((currEL() == EL1) && !inSecureState() && hcr_fmo) {
+              ICH_HCR_EL2 ich_hcr_el2 = isa->readMiscRegNoEffect(MISCREG_ICH_HCR_EL2);
+              if (ich_hcr_el2.TC) {
+                  simulateHypervisorTrap(val);
+              } else {
+                  generateVSGI(val, Gicv3::G0S);
+              }
+              return;
+          }
+          generateSGI(val, Gicv3::G0S);
+          break;
+      }
 
       // Software Generated Interrupt Group 1 Register
       case MISCREG_ICC_SGI1R:
@@ -1486,10 +1501,19 @@ Gicv3CPUInterface::setMiscReg(int misc_reg, RegVal val)
       // Alias Software Generated Interrupt Group 1 Register
       case MISCREG_ICC_ASGI1R:
       case MISCREG_ICC_ASGI1R_EL1: {
-        Gicv3::GroupId group = inSecureState() ? Gicv3::G1NS : Gicv3::G1S;
-
-        generateSGI(val, group);
-        break;
+          bool hcr_fmo = getHCREL2FMO();
+          if ((currEL() == EL1) && !inSecureState() && hcr_fmo) {
+              ICH_HCR_EL2 ich_hcr_el2 = isa->readMiscRegNoEffect(MISCREG_ICH_HCR_EL2);
+              if (ich_hcr_el2.TC) {
+                  simulateHypervisorTrap(val);
+              } else {
+                  generateVSGI(val, Gicv3::G0S);
+              }
+              return;
+          }
+          Gicv3::GroupId group = inSecureState() ? Gicv3::G1NS : Gicv3::G1S;
+          generateSGI(val, group);
+          break;
       }
 
       // System Register Enable Register EL1
@@ -2771,7 +2795,7 @@ Gicv3CPUInterface::unserialize(CheckpointIn & cp)
 void
 Gicv3CPUInterface::generateVSGI(RegVal val, Gicv3::GroupId group)
 {
-    panic_if(group != Gicv3::G1NS, "vSGI direct injection must target G1NS");
+    (void)group;
 
     uint8_t aff3 = bits(val, 55, 48);
     uint8_t aff2 = bits(val, 39, 32);
