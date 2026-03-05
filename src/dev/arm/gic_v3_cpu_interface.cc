@@ -1100,7 +1100,10 @@ Gicv3CPUInterface::setMiscReg(int misc_reg, RegVal val)
           int lr_idx = virtualFindActive(int_id);
 
           if (lr_idx < 0) {
-              if (int_id < Gicv3Redistributor::SMALLEST_LPI_ID) {
+              ICH_HCR_EL2 ich_hcr = isa->readMiscRegNoEffect(MISCREG_ICH_HCR_EL2);
+              if (int_id < 16 && ich_hcr.TC == 0) {
+                  DPRINTF(GIC, "vSGI: Direct DIR without LR. Ignoring EOIcount.\n");
+              } else if (int_id < Gicv3Redistributor::SMALLEST_LPI_ID) {
                   virtualIncrementEOICount();
               }
           } else {
@@ -2795,6 +2798,9 @@ Gicv3CPUInterface::generateVSGI(RegVal val, Gicv3::GroupId group)
         DPRINTF(GIC, "vSGI: Direct injecting INTID %d to vPE %d\n", int_id, target_vpeid);
 
         // Reuse VLPI direct injection method for vSGI
+        // FIXME: For Non-Resident vPEs, vpt_addr is hardcoded as 0.
+        // This causes the vSGI to be silently dropped if the vPE is not currently scheduled.
+        // A complete fix requires querying the ITS VPE table for the actual vpt_addr.
         redist_i->setClrVLPI(int_id, target_vpeid, 0, true);
 
         if (!redist_i->vpeResident || redist_i->residentVpeId != target_vpeid) {
@@ -2836,17 +2842,25 @@ Gicv3CPUInterface::simulateHypervisorTrap(RegVal val)
         DPRINTF(GIC, "vSGI: Hypervisor simulated injection INTID %d to LR of CPU %d\n", int_id, i);
         Gicv3CPUInterface *target_cpu = gic->getCPUInterface(i);
 
+        bool injected = false;
         for (int lr_idx = 0; lr_idx < VIRTUAL_NUM_LIST_REGS; lr_idx++) {
             ICH_LR_EL2 ich_lr_el2 = target_cpu->isa->readMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx);
             if (ich_lr_el2.State == ICH_LR_EL2_STATE_INVALID) {
+                // [CRITICAL FIX] Clear entire union to wipe dirty HW/pINTID bits from previous IRQs
+                ich_lr_el2 = 0;
+
                 ich_lr_el2.State = ICH_LR_EL2_STATE_PENDING;
                 ich_lr_el2.vINTID = int_id;
                 ich_lr_el2.Priority = 0xa0; // Default virtual priority for trap
                 ich_lr_el2.Group = 1;       // G1NS
                 target_cpu->isa->setMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx, ich_lr_el2);
                 target_cpu->virtualUpdate();
+                injected = true;
                 break;
             }
+        }
+        if (!injected) {
+            warn("vSGI Trap: All LRs on CPU %d are busy! Dropping vSGI %d\n", i, int_id);
         }
     }
 }
