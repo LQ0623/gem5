@@ -448,7 +448,7 @@ Gicv3CPUInterface::readMiscReg(int misc_reg)
           uint8_t direct_prio = direct_valid ? hppvi_direct.prio : 0xff;
 
           // 中文说明：跨组做全局优先级比较，IAR0 仅返回 Group0 中断。
-          bool lr_is_highest = lr_can_preempt && (lr_prio < direct_prio);
+          bool lr_is_highest = lr_can_preempt && (lr_prio < direct_prio || (!lr_group1 && lr_prio == direct_prio));
 
           uint32_t int_id = Gicv3::INTID_SPURIOUS;
 
@@ -514,8 +514,8 @@ Gicv3CPUInterface::readMiscReg(int misc_reg)
           const bool direct_valid = hppviDirectCanPreempt();
           uint8_t direct_prio = direct_valid ? hppvi_direct.prio : 0xff;
 
-          bool direct_is_highest = direct_valid && (direct_prio <= lr_prio);
-          bool lr_is_highest = lr_can_preempt && (lr_prio < direct_prio);
+          bool direct_is_highest = direct_valid && (direct_prio < lr_prio || (direct_prio == lr_prio && lr_group1));
+          bool lr_is_highest = lr_can_preempt && (lr_prio < direct_prio || (lr_prio == direct_prio && !lr_group1));
 
           uint32_t int_id = Gicv3::INTID_SPURIOUS;
 
@@ -1459,12 +1459,8 @@ Gicv3CPUInterface::setMiscReg(int misc_reg, RegVal val)
       case MISCREG_ICC_SGI0R_EL1: {
           bool hcr_fmo = getHCREL2FMO();
           if ((currEL() == EL1) && !inSecureState() && hcr_fmo) {
-              ICH_HCR_EL2 ich_hcr_el2 = isa->readMiscRegNoEffect(MISCREG_ICH_HCR_EL2);
-              if (ich_hcr_el2.TC) {
-                  simulateHypervisorTrap(val);
-              } else {
-                  generateVSGI(val, Gicv3::G0S);
-              }
+              // Group 0 vSGIs (vFIQ) always trap to hypervisor
+              simulateHypervisorTrap(val, Gicv3::G0S);
               return;
           }
           generateSGI(val, Gicv3::G0S);
@@ -1484,7 +1480,7 @@ Gicv3CPUInterface::setMiscReg(int misc_reg, RegVal val)
                   DPRINTF(GIC,
                           "vSGI: Trap-based mode (TC=1), simulating "
                           "Hypervisor injection.\n");
-                  simulateHypervisorTrap(val);
+                  simulateHypervisorTrap(val, Gicv3::G1NS);
               } else {
                   // Direct mode: GICv4.1 hardware direct injection
                   DPRINTF(GIC, "vSGI: Direct injection mode (TC=0).\n");
@@ -1503,12 +1499,8 @@ Gicv3CPUInterface::setMiscReg(int misc_reg, RegVal val)
       case MISCREG_ICC_ASGI1R_EL1: {
           bool hcr_fmo = getHCREL2FMO();
           if ((currEL() == EL1) && !inSecureState() && hcr_fmo) {
-              ICH_HCR_EL2 ich_hcr_el2 = isa->readMiscRegNoEffect(MISCREG_ICH_HCR_EL2);
-              if (ich_hcr_el2.TC) {
-                  simulateHypervisorTrap(val);
-              } else {
-                  generateVSGI(val, Gicv3::G0S);
-              }
+              // ASGI1R in NS state maps to Group 0 (vFIQ), always traps
+              simulateHypervisorTrap(val, Gicv3::G0S);
               return;
           }
           Gicv3::GroupId group = inSecureState() ? Gicv3::G1NS : Gicv3::G1S;
@@ -2211,7 +2203,7 @@ Gicv3CPUInterface::virtualUpdate()
 
     const bool direct_valid = hppviDirectCanPreempt();
     const bool direct_wins = direct_valid &&
-        (!lr_valid || hppvi_direct.prio <= lr_prio);
+        (!lr_valid || (hppvi_direct.prio < lr_prio) || (hppvi_direct.prio == lr_prio && lr_group1));
 
     if (direct_wins) {
         signal_IRQ = true;
@@ -2840,7 +2832,7 @@ Gicv3CPUInterface::triggerDoorbell(uint32_t vpeid)
 }
 
 void
-Gicv3CPUInterface::simulateHypervisorTrap(RegVal val)
+Gicv3CPUInterface::simulateHypervisorTrap(RegVal val, Gicv3::GroupId group)
 {
     uint8_t aff3 = bits(val, 55, 48);
     uint8_t aff2 = bits(val, 39, 32);
@@ -2876,7 +2868,7 @@ Gicv3CPUInterface::simulateHypervisorTrap(RegVal val)
                 ich_lr_el2.State = ICH_LR_EL2_STATE_PENDING;
                 ich_lr_el2.vINTID = int_id;
                 ich_lr_el2.Priority = 0xa0; // Default virtual priority for trap
-                ich_lr_el2.Group = 1;       // G1NS
+                ich_lr_el2.Group = (group == Gicv3::G0S) ? 0 : 1;
                 target_cpu->isa->setMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx, ich_lr_el2);
                 target_cpu->virtualUpdate();
                 injected = true;

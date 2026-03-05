@@ -317,7 +317,7 @@ class Gicv3CPUInterface : public ArmISA::BaseISADevice, public Serializable
     void generateSGI(RegVal val, Gicv3::GroupId group);
     // vSGI routing and doorbell mechanics
     void generateVSGI(RegVal val, Gicv3::GroupId group);
-    void simulateHypervisorTrap(RegVal val);
+    void simulateHypervisorTrap(RegVal val, Gicv3::GroupId group);
     void triggerDoorbell(uint32_t vpeid);
     ArmISA::ExceptionLevel currEL() const;
     void deactivateIRQ(uint32_t intid, Gicv3::GroupId group);
