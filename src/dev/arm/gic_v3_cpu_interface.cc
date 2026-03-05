@@ -2629,9 +2629,9 @@ Gicv3CPUInterface::maintenanceInterruptStatus() const
     }
 
     // No Pending. [bit 3]
-    // This maintenance interrupt is asserted when ICH_HCR_EL2.NPIE==1 and
-    // no List register is in pending state.
-    if (ich_hcr_el2.NPIE && (num_pending_interrupts == 0)) {
+    // This maintenance interrupt is asserted when ICH_HCR_EL2.NPIE==1,
+    // no List register is in pending state, and no direct vPE interrupts are pending.
+    if (ich_hcr_el2.NPIE && (num_pending_interrupts == 0) && (hppvi_direct.prio == 0xff)) {
         ich_misr_el2.NP = 1;
     }
 

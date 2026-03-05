@@ -1060,7 +1060,7 @@ Gicv3Redistributor::setClrLPI(uint64_t data, bool set)
     uint32_t lpi_id = data & 0xffffffff;
     uint32_t largest_lpi_id = 1 << (lpiIDBits + 1);
 
-    if (lpi_id > largest_lpi_id) {
+    if (lpi_id >= largest_lpi_id) {
         // Writes to GICR_SETLPIR or GICR_CLRLPIR have not effect if
         // pINTID value specifies an unimplemented LPI.
         return;
@@ -1102,10 +1102,6 @@ void
 Gicv3Redistributor::setClrVLPI(uint32_t vintid, uint32_t vpeid,
                                uint64_t vpt_addr, bool set)
 {
-    if (!EnableLPIs) {
-        return;
-    }
-
     const bool is_resident = (vpeResident && residentVpeId == vpeid);
 
     Addr pending_base = 0;
@@ -1122,7 +1118,7 @@ Gicv3Redistributor::setClrVLPI(uint32_t vintid, uint32_t vpeid,
     const uint32_t lpi_id = vintid;
     const uint32_t largest_lpi_id = 1 << (vLpiIDBits + 1);
 
-    if (lpi_id > largest_lpi_id) {
+    if (lpi_id >= largest_lpi_id) {
         return;
     }
 
