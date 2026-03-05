@@ -975,8 +975,11 @@ Gicv3CPUInterface::setMiscReg(int misc_reg, RegVal val)
           int lr_idx = virtualFindActive(int_id);
 
           if (lr_idx < 0) {
-              // 中文说明：直注 vLPI 不在 LR 中属于合法行为。
-              if (int_id < Gicv3Redistributor::SMALLEST_LPI_ID) {
+              ICH_HCR_EL2 ich_hcr = isa->readMiscRegNoEffect(MISCREG_ICH_HCR_EL2);
+              if (int_id < 16 && ich_hcr.TC == 0) {
+                  // Direct vSGIs are not in the List Registers; do not increment EOIcount
+                  DPRINTF(GIC, "vSGI: Direct EOI without LR.\n");
+              } else if (int_id < Gicv3Redistributor::SMALLEST_LPI_ID) {
                   virtualIncrementEOICount();
               }
           } else {
@@ -1453,10 +1456,28 @@ Gicv3CPUInterface::setMiscReg(int misc_reg, RegVal val)
       // Software Generated Interrupt Group 1 Register
       case MISCREG_ICC_SGI1R:
       case MISCREG_ICC_SGI1R_EL1: {
-        Gicv3::GroupId group = inSecureState() ? Gicv3::G1S : Gicv3::G1NS;
+          bool hcr_imo = getHCREL2IMO();
+          // Intercept virtual SGI generation if at EL1 and virtualized (IMO=1)
+          if ((currEL() == EL1) && !inSecureState() && hcr_imo) {
+              ICH_HCR_EL2 ich_hcr_el2 =
+                  isa->readMiscRegNoEffect(MISCREG_ICH_HCR_EL2);
+              if (ich_hcr_el2.TC) {
+                  // Trap mode: simulate KVM/Hypervisor trap injection
+                  DPRINTF(GIC,
+                          "vSGI: Trap-based mode (TC=1), simulating "
+                          "Hypervisor injection.\n");
+                  simulateHypervisorTrap(val);
+              } else {
+                  // Direct mode: GICv4.1 hardware direct injection
+                  DPRINTF(GIC, "vSGI: Direct injection mode (TC=0).\n");
+                  generateVSGI(val, Gicv3::G1NS);
+              }
+              return;
+          }
 
-        generateSGI(val, group);
-        break;
+          Gicv3::GroupId group = inSecureState() ? Gicv3::G1S : Gicv3::G1NS;
+          generateSGI(val, group);
+          break;
       }
 
       // Alias Software Generated Interrupt Group 1 Register
@@ -2741,6 +2762,93 @@ Gicv3CPUInterface::unserialize(CheckpointIn & cp)
     UNSERIALIZE_SCALAR(hppvi_direct.intid);
     UNSERIALIZE_SCALAR(hppvi_direct.prio);
     UNSERIALIZE_ENUM(hppvi_direct.group);
+}
+
+
+void
+Gicv3CPUInterface::generateVSGI(RegVal val, Gicv3::GroupId group)
+{
+    panic_if(group != Gicv3::G1NS, "vSGI direct injection must target G1NS");
+
+    uint8_t aff3 = bits(val, 55, 48);
+    uint8_t aff2 = bits(val, 39, 32);
+    uint8_t aff1 = bits(val, 23, 16);
+    uint16_t target_list = bits(val, 15, 0);
+    uint32_t int_id = bits(val, 27, 24);
+    bool irm = bits(val, 40, 40);
+    uint8_t rs = bits(val, 47, 44);
+
+    for (int i = 0; i < gic->getSystem()->threads.size(); i++) {
+        Gicv3Redistributor * redist_i = gic->getRedistributor(i);
+        uint32_t affinity_i = redist_i->getAffinity();
+
+        if (irm) {
+            if (affinity_i == redistributor->getAffinity()) continue;
+        } else {
+            if ((affinity_i >> 8) != ((aff3 << 16) | (aff2 << 8) | (aff1 << 0))) continue;
+            uint8_t aff0_i = bits(affinity_i, 7, 0);
+            if (!(aff0_i >= rs * 16 && aff0_i < (rs + 1) * 16 &&
+                ((0x1 << (aff0_i - rs * 16)) & target_list))) continue;
+        }
+
+        uint32_t target_vpeid = i;
+        DPRINTF(GIC, "vSGI: Direct injecting INTID %d to vPE %d\n", int_id, target_vpeid);
+
+        // Reuse VLPI direct injection method for vSGI
+        redist_i->setClrVLPI(int_id, target_vpeid, 0, true);
+
+        if (!redist_i->vpeResident || redist_i->residentVpeId != target_vpeid) {
+            triggerDoorbell(target_vpeid);
+        }
+    }
+}
+
+void
+Gicv3CPUInterface::triggerDoorbell(uint32_t vpeid)
+{
+    DPRINTF(GIC, "vSGI: vPE %d is NOT resident. Triggering Doorbell!\n", vpeid);
+}
+
+void
+Gicv3CPUInterface::simulateHypervisorTrap(RegVal val)
+{
+    uint8_t aff3 = bits(val, 55, 48);
+    uint8_t aff2 = bits(val, 39, 32);
+    uint8_t aff1 = bits(val, 23, 16);
+    uint16_t target_list = bits(val, 15, 0);
+    uint32_t int_id = bits(val, 27, 24);
+    bool irm = bits(val, 40, 40);
+    uint8_t rs = bits(val, 47, 44);
+
+    for (int i = 0; i < gic->getSystem()->threads.size(); i++) {
+        Gicv3Redistributor * redist_i = gic->getRedistributor(i);
+        uint32_t affinity_i = redist_i->getAffinity();
+
+        if (irm) {
+            if (affinity_i == redistributor->getAffinity()) continue;
+        } else {
+            if ((affinity_i >> 8) != ((aff3 << 16) | (aff2 << 8) | (aff1 << 0))) continue;
+            uint8_t aff0_i = bits(affinity_i, 7, 0);
+            if (!(aff0_i >= rs * 16 && aff0_i < (rs + 1) * 16 &&
+                ((0x1 << (aff0_i - rs * 16)) & target_list))) continue;
+        }
+
+        DPRINTF(GIC, "vSGI: Hypervisor simulated injection INTID %d to LR of CPU %d\n", int_id, i);
+        Gicv3CPUInterface *target_cpu = gic->getCPUInterface(i);
+
+        for (int lr_idx = 0; lr_idx < VIRTUAL_NUM_LIST_REGS; lr_idx++) {
+            ICH_LR_EL2 ich_lr_el2 = target_cpu->isa->readMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx);
+            if (ich_lr_el2.State == ICH_LR_EL2_STATE_INVALID) {
+                ich_lr_el2.State = ICH_LR_EL2_STATE_PENDING;
+                ich_lr_el2.vINTID = int_id;
+                ich_lr_el2.Priority = 0xa0; // Default virtual priority for trap
+                ich_lr_el2.Group = 1;       // G1NS
+                target_cpu->isa->setMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx, ich_lr_el2);
+                target_cpu->virtualUpdate();
+                break;
+            }
+        }
+    }
 }
 
 } // namespace gem5
