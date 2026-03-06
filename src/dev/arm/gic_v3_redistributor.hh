@@ -41,7 +41,6 @@
 #ifndef __DEV_ARM_GICV3_REDISTRIBUTOR_H__
 #define __DEV_ARM_GICV3_REDISTRIBUTOR_H__
 
-#include <array>
 #include <map>
 
 #include "base/addr_range.hh"
@@ -201,10 +200,8 @@ class Gicv3Redistributor : public Serializable
     bool vpeResident;
     uint32_t residentVpeId;
 
-    // GICv4.1: vSGI pending and config are architectural state in GIC.
-    // Each config byte follows the LPI format: bit[0]=enable, bit[7:2]=priority.
+    // GICv4.1: vSGI pending state is architectural state in GIC.
     std::map<uint16_t, uint16_t> vsgiPendingByVpe;
-    std::map<uint16_t, std::array<uint8_t, 16>> vsgiConfigByVpe;
     uint16_t queriedVpeId;
 
     // Track whether vLPI direct-injection candidate needs refresh.
@@ -293,7 +290,6 @@ class Gicv3Redistributor : public Serializable
     void refreshDirectVlpi();
 
   public:
-    void setVsgiConfig(uint16_t vpeid, uint32_t intid, bool enable, uint8_t prio);
     void clearVsgiPending(uint16_t vpeid, uint32_t intid);
     void migrateVpeVsgiState(uint16_t vpeid, Gicv3Redistributor *new_rd);
     void markDirectVlpiDirty();

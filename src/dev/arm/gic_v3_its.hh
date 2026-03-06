@@ -144,6 +144,7 @@ class Gicv3Its : public BasicPioDevice
         GITS_CTLR    = itsControl + 0x0000,
         GITS_IIDR    = itsControl + 0x0004,
         GITS_TYPER   = itsControl + 0x0008,
+        GITS_SGIR    = itsControl + 0x0020,
         GITS_CBASER  = itsControl + 0x0080,
         GITS_CWRITER = itsControl + 0x0088,
         GITS_CREADR  = itsControl + 0x0090,

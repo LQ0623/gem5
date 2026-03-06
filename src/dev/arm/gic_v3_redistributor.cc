@@ -390,11 +390,9 @@ Gicv3Redistributor::read(Addr addr, size_t size, bool is_secure_access)
         return vLpiConfigurationTablePtr | vLpiIDBits;
 
       case GICR_VPENDBASER:
-        if (gic->params().gicv4_1) {
-            // GICv4.1: bit[62] IDAI is modeled as 0 (no asynchronous invalidation).
-            return ((uint64_t)vpeResident << 63) | (residentVpeId & 0xFFFF);
-        }
-        return vLpiPendingTablePtr;
+        // bit[62] IDAI is modeled as 0 (no asynchronous invalidation).
+        return ((uint64_t)vpeResident << 63) | vLpiPendingTablePtr |
+               (gic->params().gicv4_1 ? (residentVpeId & 0xFFFF) : 0);
 
       case GICR_VSGIPENDR:
         // Busy bit [31] is returned as 0 (query complete).
@@ -884,17 +882,15 @@ Gicv3Redistributor::refreshDirectVlpi()
     const uint16_t vsgi_pending =
         vsgiPendingByVpe.count(vpeid16) ? vsgiPendingByVpe[vpeid16] : 0;
 
-    auto cfg_it = vsgiConfigByVpe.find(vpeid16);
-    if (cfg_it == vsgiConfigByVpe.end()) {
-        cfg_it = vsgiConfigByVpe.emplace(vpeid16, std::array<uint8_t, 16>{}).first;
-    }
-
     for (uint32_t sgi_id = 0; sgi_id < 16; sgi_id++) {
-        if ((vsgi_pending & (1U << sgi_id)) == 0) {
+        if ((vsgi_pending & (1U << sgi_id)) == 0 || !vLpiConfigurationTablePtr) {
             continue;
         }
 
-        LPIConfigurationTableEntry config = cfg_it->second[sgi_id];
+        uint8_t cfg_raw = 0;
+        memProxy->readBlob(vLpiConfigurationTablePtr + sgi_id,
+                           &cfg_raw, sizeof(cfg_raw));
+        LPIConfigurationTableEntry config = cfg_raw;
         if (!config.enable) {
             continue;
         }
@@ -951,26 +947,6 @@ Gicv3Redistributor::refreshDirectVlpi()
 }
 
 void
-Gicv3Redistributor::setVsgiConfig(
-    uint16_t vpeid, uint32_t intid, bool enable, uint8_t prio)
-{
-    if (intid >= 16) {
-        return;
-    }
-
-    auto &cfg = vsgiConfigByVpe[vpeid];
-    LPIConfigurationTableEntry entry = cfg[intid];
-    entry.enable = enable;
-    entry.priority = (prio >> 2);
-    cfg[intid] = entry;
-
-    if (vpeResident && (residentVpeId & 0xFFFF) == vpeid) {
-        directVlpiDirty = true;
-        updateDistributor();
-    }
-}
-
-void
 Gicv3Redistributor::clearVsgiPending(uint16_t vpeid, uint32_t intid)
 {
     if (intid >= 16) {
@@ -996,12 +972,6 @@ Gicv3Redistributor::migrateVpeVsgiState(
     if (pend_it != vsgiPendingByVpe.end()) {
         new_rd->vsgiPendingByVpe[vpeid] = pend_it->second;
         vsgiPendingByVpe.erase(pend_it);
-    }
-
-    auto cfg_it = vsgiConfigByVpe.find(vpeid);
-    if (cfg_it != vsgiConfigByVpe.end()) {
-        new_rd->vsgiConfigByVpe[vpeid] = cfg_it->second;
-        vsgiConfigByVpe.erase(cfg_it);
     }
 
     if (vpeResident && (residentVpeId & 0xFFFF) == vpeid) {
@@ -1262,14 +1232,12 @@ Gicv3Redistributor::setClrVLPI(uint32_t vintid, uint32_t vpeid,
         }
 
         if (is_resident) {
-            if (set) {
-                auto cfg_it = vsgiConfigByVpe.find(vpeid16);
-                if (cfg_it != vsgiConfigByVpe.end()) {
-                    LPIConfigurationTableEntry cfg = cfg_it->second[vintid];
-                    if (!cfg.enable) {
-                        updateDistributor();
-                        return;
-                    }
+            if (set && vLpiConfigurationTablePtr) {
+                uint8_t cfg_raw = 0;
+                memProxy->readBlob(vLpiConfigurationTablePtr + vintid,
+                                   &cfg_raw, sizeof(cfg_raw));
+                LPIConfigurationTableEntry cfg = cfg_raw;
+                if (cfg.enable) {
                     const uint8_t prio = cfg.priority << 2;
                     if ((prio < cpuInterface->hppvi_direct.prio) ||
                         (prio == cpuInterface->hppvi_direct.prio &&
@@ -1279,7 +1247,7 @@ Gicv3Redistributor::setClrVLPI(uint32_t vintid, uint32_t vpeid,
                         cpuInterface->hppvi_direct.group = Gicv3::G1NS;
                     }
                 }
-            } else if (cpuInterface->hppvi_direct.intid == vintid) {
+            } else if (!set && cpuInterface->hppvi_direct.intid == vintid) {
                 directVlpiDirty = true;
             }
             updateDistributor();
@@ -1467,7 +1435,6 @@ Gicv3Redistributor::serialize(CheckpointOut & cp) const
     SERIALIZE_SCALAR(vpeResident);
     SERIALIZE_SCALAR(residentVpeId);
     SERIALIZE_CONTAINER(vsgiPendingByVpe);
-    SERIALIZE_CONTAINER(vsgiConfigByVpe);
     SERIALIZE_SCALAR(queriedVpeId);
     SERIALIZE_SCALAR(directVlpiDirty);
 }
@@ -1498,7 +1465,6 @@ Gicv3Redistributor::unserialize(CheckpointIn & cp)
     UNSERIALIZE_SCALAR(vpeResident);
     UNSERIALIZE_SCALAR(residentVpeId);
     UNSERIALIZE_CONTAINER(vsgiPendingByVpe);
-    UNSERIALIZE_CONTAINER(vsgiConfigByVpe);
     UNSERIALIZE_SCALAR(queriedVpeId);
     UNSERIALIZE_SCALAR(directVlpiDirty);
 }

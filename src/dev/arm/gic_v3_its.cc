@@ -1071,8 +1071,6 @@ ItsCommand::vsgi(Yield &yield, CommandEntry &command)
     const uint16_t vpe_id = bits(command.raw[1], 47, 32);
     const uint32_t vintid = bits(command.raw[2], 31, 0);
     const bool clear = bits(command.raw[2], 63, 63);
-    const bool enable = bits(command.raw[3], 0, 0);
-    const uint8_t prio = bits(command.raw[3], 7, 2);
 
     if (vintid >= 16) {
         return;
@@ -1082,11 +1080,7 @@ ItsCommand::vsgi(Yield &yield, CommandEntry &command)
     for (int i = 0; i < its.gic->getSystem()->threads.size(); i++) {
         auto *rd = its.gic->getRedistributor(i);
         if (rd->vpeResident && ((rd->residentVpeId & 0xFFFF) == vpe_id)) {
-            if (clear) {
-                rd->clearVsgiPending(vpe_id, vintid);
-            } else {
-                rd->setVsgiConfig(vpe_id, vintid, enable, prio);
-            }
+            rd->setClrVLPI(vintid, vpe_id, 0, !clear);
             return;
         }
     }
@@ -1095,10 +1089,8 @@ ItsCommand::vsgi(Yield &yield, CommandEntry &command)
     VPETE vpete;
     if (its.readVpe(vpe_id, vpete) && vpete.valid) {
         auto *rd = its.getRedistributor(vpete.rdBase);
-        if (clear) {
-            rd->clearVsgiPending(vpe_id, vintid);
-        } else {
-            rd->setVsgiConfig(vpe_id, vintid, enable, prio);
+        if (rd) {
+            rd->setClrVLPI(vintid, vpe_id, 0, !clear);
         }
     }
 }
@@ -1308,6 +1300,39 @@ Gicv3Its::write(PacketPtr pkt)
             translate(pkt);
         }
         break;
+
+      case GITS_SGIR: {
+        uint64_t data = 0;
+        if (pkt->getSize() == sizeof(uint32_t)) {
+            data = pkt->getLE<uint32_t>();
+        } else {
+            assert(pkt->getSize() == sizeof(uint64_t));
+            data = pkt->getLE<uint64_t>();
+        }
+        const uint16_t vpeid = bits(data, 47, 32);
+        const uint32_t intid = bits(data, 31, 0);
+
+        Gicv3Redistributor *target = nullptr;
+        for (int i = 0; i < gic->getSystem()->threads.size(); i++) {
+            auto *rd = gic->getRedistributor(i);
+            if (rd->vpeResident && ((rd->residentVpeId & 0xFFFF) == vpeid)) {
+                target = rd;
+                break;
+            }
+        }
+
+        if (!target) {
+            VPETE vpete;
+            if (readVpe(vpeid, vpete) && vpete.valid) {
+                target = getRedistributor(vpete.rdBase);
+            }
+        }
+
+        if (target) {
+            target->setClrVLPI(intid, vpeid, 0, true);
+        }
+        break;
+      }
 
       default:
         if (GITS_BASER.contains(addr)) {

@@ -497,12 +497,11 @@ Gicv3CPUInterface::readMiscReg(int misc_reg)
               isa->setMiscRegNoEffect(apr_idx, apr);
 
               uint32_t clr_intid = hppvi_direct.intid;
-              hppvi_direct.intid = Gicv3::INTID_SPURIOUS;
-              hppvi_direct.prio = 0xff;
-
               redistributor->setClrVLPI(clr_intid,
                                         redistributor->residentVpeId,
                                         0, false);
+              hppvi_direct.intid = Gicv3::INTID_SPURIOUS;
+              hppvi_direct.prio = 0xff;
           } else if (lr_is_highest) {
               ICH_LR_EL2 ich_lr_el2 =
                   isa->readMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx);
@@ -598,12 +597,11 @@ Gicv3CPUInterface::readMiscReg(int misc_reg)
 
               // 中文说明：必须先本地清空槽位，避免 setClrVLPI 触发重扫后被覆盖。
               uint32_t clr_intid = hppvi_direct.intid;
-              hppvi_direct.intid = Gicv3::INTID_SPURIOUS;
-              hppvi_direct.prio = 0xff;
-
               redistributor->setClrVLPI(clr_intid,
                                         redistributor->residentVpeId,
                                         0, false);
+              hppvi_direct.intid = Gicv3::INTID_SPURIOUS;
+              hppvi_direct.prio = 0xff;
           } else if (lr_is_highest && lr_group1) {
               ICH_LR_EL2 ich_lr_el2 =
                   isa->readMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx);
@@ -1523,8 +1521,13 @@ Gicv3CPUInterface::setMiscReg(int misc_reg, RegVal val)
       case MISCREG_ICC_SGI0R_EL1: {
           bool hcr_fmo = getHCREL2FMO();
           if ((currEL() == EL1) && !inSecureState() && hcr_fmo) {
-              // Group 0 vSGIs (vFIQ) always trap to hypervisor
-              simulateHypervisorTrap(val, Gicv3::G0S);
+              ICH_HCR_EL2 ich_hcr_el2 =
+                  isa->readMiscRegNoEffect(MISCREG_ICH_HCR_EL2);
+              if (ich_hcr_el2.TC) {
+                  simulateHypervisorTrap(val, Gicv3::G0S);
+              } else {
+                  generateVSGI(val, Gicv3::G0S);
+              }
               return;
           }
           generateSGI(val, Gicv3::G0S);
