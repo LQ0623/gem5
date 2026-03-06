@@ -709,8 +709,9 @@ ItsCommand::inv(Yield &yield, CommandEntry &command)
             its.incrementReadPointer();
             terminate(yield);
         }
-        // 暂无虚拟缓存模型，命令语义为 no-op。
-        (void)vpete;
+        auto *rd = its.getRedistributor(vpete.rdBase);
+        rd->markDirectVlpiDirty();
+        rd->updateDistributor();
     } else {
         const auto collection_id = itte.icid;
         CTE cte = readIrqCollectionTable(yield, collection_id);
@@ -931,12 +932,9 @@ ItsCommand::sync(Yield &yield, CommandEntry &command)
 void
 ItsCommand::vinvall(Yield &yield, CommandEntry &command)
 {
-    if (collectionOutOfRange(command)) {
-        its.incrementReadPointer();
-        terminate(yield);
-    }
-
-    // No virtual interrupt cache modelled yet.
+    (void)yield;
+    const uint32_t vpe_id = bits(command.raw[1], 47, 32);
+    its.markVpeDirty(vpe_id & 0xFFFF);
 }
 
 void
@@ -971,9 +969,9 @@ ItsCommand::vmapp(Yield &yield, CommandEntry &command)
 {
     // 中文说明：按 IHI0069 重新解析 VMAPP 位域。
     const uint32_t vpe_id = bits(command.raw[1], 47, 32);
-    const uint64_t rd_base = bits(command.raw[2], 50, 16);
+    const uint64_t rd_base = bits(command.raw[2], 51, 16);
     const uint64_t vpt_addr = bits(command.raw[3], 51, 16);
-    const bool valid = bits(command.raw[3], 63);
+    const bool valid = bits(command.raw[2], 63);
 
     VPETE vpete;
     vpete.valid = valid;
@@ -993,7 +991,7 @@ ItsCommand::vmapti(Yield &yield, CommandEntry &command)
 
     DTE dte = readDeviceTable(yield, command.deviceId);
 
-    const uint32_t pintid = bits(command.raw[3], 63, 32);
+    const uint32_t pintid = bits(command.raw[2], 63, 32);
     const uint32_t vintid = bits(command.raw[2], 31, 0);
     const uint32_t vpeid = bits(command.raw[2], 47, 32);
 
@@ -1576,6 +1574,24 @@ Gicv3Its::readVpe(uint32_t vpe_id, VPETE &vpete)
     vpete.valid = raw[2] & 0x1;
     return true;
 }
+
+void
+Gicv3Its::markVpeDirty(uint16_t vpe_id)
+{
+    if (!gic) {
+        return;
+    }
+
+    for (int i = 0; i < gic->getSystem()->threads.size(); i++) {
+        auto *rd = gic->getRedistributor(i);
+        if (rd->vpeResident && ((rd->residentVpeId & 0xFFFF) == vpe_id)) {
+            rd->markDirectVlpiDirty();
+            rd->updateDistributor();
+            break;
+        }
+    }
+}
+
 
 Addr
 Gicv3Its::pageAddress(Gicv3Its::ItsTables table)

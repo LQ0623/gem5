@@ -307,9 +307,10 @@ class Gicv3Its : public BasicPioDevice
 
   public:
     bool readVpe(uint32_t vpe_id, VPETE &vpete);
+    void markVpeDirty(uint16_t vpe_id);
+    Gicv3Redistributor* getRedistributor(uint64_t rd_base);
 
   private:
-    Gicv3Redistributor* getRedistributor(uint64_t rd_base);
     Gicv3Redistributor* getRedistributor(CTE cte)
     {
         return getRedistributor(cte.rdBase);

@@ -464,15 +464,46 @@ Gicv3CPUInterface::readMiscReg(int misc_reg)
               lr_can_preempt = hppviCanPreempt(lr_idx);
           }
 
+          if (!lr_can_preempt) {
+              lr_prio = 0xff;
+          }
+
           const bool direct_valid = hppviDirectCanPreempt();
+          const bool direct_group0 =
+              direct_valid && (hppvi_direct.group == Gicv3::G0S);
           uint8_t direct_prio = direct_valid ? hppvi_direct.prio : 0xff;
 
-          // 中文说明：跨组做全局优先级比较，IAR0 仅返回 Group0 中断。
-          bool lr_is_highest = lr_can_preempt && (lr_prio < direct_prio || (!lr_group1 && lr_prio == direct_prio));
+          bool direct_is_highest = direct_group0 &&
+              (direct_prio < lr_prio || (direct_prio == lr_prio && lr_group1));
+          bool lr_is_highest = lr_can_preempt && !lr_group1 &&
+              (lr_prio < direct_prio || (lr_prio == direct_prio && !direct_group0));
 
           uint32_t int_id = Gicv3::INTID_SPURIOUS;
 
-          if (lr_is_highest && !lr_group1) {
+          if (direct_is_highest) {
+              int_id = hppvi_direct.intid;
+
+              uint8_t prio = hppvi_direct.prio & 0xf8;
+              int apr_bit = prio >> (8 - VIRTUAL_PREEMPTION_BITS);
+              int reg_no = apr_bit / 32;
+              int reg_bit = apr_bit % 32;
+              int apr_idx = MISCREG_ICH_AP0R0_EL2 + reg_no;
+              RegVal apr = isa->readMiscRegNoEffect(apr_idx);
+              apr |= (1ULL << reg_bit);
+              isa->setMiscRegNoEffect(apr_idx, apr);
+
+              uint32_t clr_intid = hppvi_direct.intid;
+              hppvi_direct.intid = Gicv3::INTID_SPURIOUS;
+              hppvi_direct.prio = 0xff;
+
+              redistributor->setClrVLPI(clr_intid,
+                                        redistributor->residentVpeId,
+                                        0, false);
+              if (clr_intid < 16) {
+                  redistributor->setVsgiActive(
+                      redistributor->residentVpeId & 0xFFFF, clr_intid);
+              }
+          } else if (lr_is_highest) {
               ICH_LR_EL2 ich_lr_el2 =
                   isa->readMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx);
               int_id = ich_lr_el2.vINTID;
@@ -554,7 +585,7 @@ Gicv3CPUInterface::readMiscReg(int misc_reg)
               int reg_bit = apr_bit % 32;
               int apr_idx = MISCREG_ICH_AP1R0_EL2 + reg_no;
               RegVal apr = isa->readMiscRegNoEffect(apr_idx);
-              apr |= (1 << reg_bit);
+              apr |= (1ULL << reg_bit);
               isa->setMiscRegNoEffect(apr_idx, apr);
 
               // 中文说明：必须先本地清空槽位，避免 setClrVLPI 触发重扫后被覆盖。
@@ -565,6 +596,10 @@ Gicv3CPUInterface::readMiscReg(int misc_reg)
               redistributor->setClrVLPI(clr_intid,
                                         redistributor->residentVpeId,
                                         0, false);
+              if (clr_intid < 16) {
+                  redistributor->setVsgiActive(
+                      redistributor->residentVpeId & 0xFFFF, clr_intid);
+              }
           } else if (lr_is_highest && lr_group1) {
               ICH_LR_EL2 ich_lr_el2 =
                   isa->readMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx);
@@ -1006,6 +1041,8 @@ Gicv3CPUInterface::setMiscReg(int misc_reg, RegVal val)
           if (lr_idx < 0) {
               ICH_HCR_EL2 ich_hcr = isa->readMiscRegNoEffect(MISCREG_ICH_HCR_EL2);
               if (int_id < 16 && ich_hcr.TC == 0) {
+                  redistributor->clearVsgiActive(
+                      redistributor->residentVpeId & 0xFFFF, int_id);
                   // Direct vSGIs are not in the List Registers; do not increment EOIcount
                   DPRINTF(GIC, "vSGI: Direct EOI without LR.\n");
               } else if (int_id < Gicv3Redistributor::SMALLEST_LPI_ID) {
@@ -1131,6 +1168,8 @@ Gicv3CPUInterface::setMiscReg(int misc_reg, RegVal val)
           if (lr_idx < 0) {
               ICH_HCR_EL2 ich_hcr = isa->readMiscRegNoEffect(MISCREG_ICH_HCR_EL2);
               if (int_id < 16 && ich_hcr.TC == 0) {
+                  redistributor->clearVsgiActive(
+                      redistributor->residentVpeId & 0xFFFF, int_id);
                   DPRINTF(GIC, "vSGI: Direct DIR without LR. Ignoring EOIcount.\n");
               } else if (int_id < Gicv3Redistributor::SMALLEST_LPI_ID) {
                   virtualIncrementEOICount();
@@ -1962,7 +2001,7 @@ Gicv3CPUInterface::activateIRQ(uint32_t int_id, Gicv3::GroupId group)
     }
 
     RegVal apr = isa->readMiscRegNoEffect(apr_idx);
-    apr |= (1 << reg_bit);
+    apr |= (1ULL << reg_bit);
     isa->setMiscRegNoEffect(apr_idx, apr);
 
     // Move interrupt state from pending to active.
@@ -2003,7 +2042,7 @@ Gicv3CPUInterface::virtualActivateIRQ(uint32_t lr_idx)
     int apr_idx = group == Gicv3::G0S ?
         MISCREG_ICH_AP0R0_EL2 + reg_no : MISCREG_ICH_AP1R0_EL2 + reg_no;
     RegVal apr = isa->readMiscRegNoEffect(apr_idx);
-    apr |= (1 << reg_bit);
+    apr |= (1ULL << reg_bit);
     isa->setMiscRegNoEffect(apr_idx, apr);
     // Move interrupt state from pending to active.
     ich_lr_el.State = ICH_LR_EL2_STATE_ACTIVE;
@@ -2915,23 +2954,51 @@ Gicv3CPUInterface::simulateHypervisorTrap(RegVal val, Gicv3::GroupId group)
         Gicv3CPUInterface *target_cpu = gic->getCPUInterface(i);
 
         bool injected = false;
+        int free_lr_idx = -1;
         for (int lr_idx = 0; lr_idx < VIRTUAL_NUM_LIST_REGS; lr_idx++) {
-            ICH_LR_EL2 ich_lr_el2 = target_cpu->isa->readMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx);
-            if (ich_lr_el2.State == ICH_LR_EL2_STATE_INVALID) {
-                // [CRITICAL FIX] Clear entire union to wipe dirty HW/pINTID bits from previous IRQs
-                ich_lr_el2 = 0;
+            ICH_LR_EL2 ich_lr_el2 =
+                target_cpu->isa->readMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx);
 
-                // HACK: This bypasses architectural EL2 trap delivery and
-                // writes LR state directly in the model.
-                ich_lr_el2.State = ICH_LR_EL2_STATE_PENDING;
-                ich_lr_el2.vINTID = int_id;
-                ich_lr_el2.Priority = 0xa0; // Default virtual priority for trap
-                ich_lr_el2.Group = (group == Gicv3::G0S) ? 0 : 1;
-                target_cpu->isa->setMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx, ich_lr_el2);
+            if (ich_lr_el2.State == ICH_LR_EL2_STATE_INVALID) {
+                if (free_lr_idx < 0) {
+                    free_lr_idx = lr_idx;
+                }
+                continue;
+            }
+
+            if (ich_lr_el2.vINTID != int_id) {
+                continue;
+            }
+
+            if (ich_lr_el2.State == ICH_LR_EL2_STATE_PENDING ||
+                ich_lr_el2.State == ICH_LR_EL2_STATE_ACTIVE_PENDING) {
+                injected = true;
+                break;
+            }
+
+            if (ich_lr_el2.State == ICH_LR_EL2_STATE_ACTIVE) {
+                ich_lr_el2.State = ICH_LR_EL2_STATE_ACTIVE_PENDING;
+                target_cpu->isa->setMiscRegNoEffect(
+                    MISCREG_ICH_LR0_EL2 + lr_idx, ich_lr_el2);
                 target_cpu->virtualUpdate();
                 injected = true;
                 break;
             }
+        }
+
+        if (free_lr_idx >= 0) {
+            ICH_LR_EL2 ich_lr_el2 = 0;
+
+            // HACK: This bypasses architectural EL2 trap delivery and
+            // writes LR state directly in the model.
+            ich_lr_el2.State = ICH_LR_EL2_STATE_PENDING;
+            ich_lr_el2.vINTID = int_id;
+            ich_lr_el2.Priority = 0xa0; // Default virtual priority for trap
+            ich_lr_el2.Group = (group == Gicv3::G0S) ? 0 : 1;
+            target_cpu->isa->setMiscRegNoEffect(
+                MISCREG_ICH_LR0_EL2 + free_lr_idx, ich_lr_el2);
+            target_cpu->virtualUpdate();
+            injected = true;
         }
         if (!injected) {
             warn("vSGI Trap: All LRs on CPU %d are busy! Dropping vSGI %d\n", i, int_id);

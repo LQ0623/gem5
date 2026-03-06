@@ -390,6 +390,12 @@ Gicv3Redistributor::read(Addr addr, size_t size, bool is_secure_access)
       case GICR_VPENDBASER:
         return ((uint64_t)vpeResident << 63) | (residentVpeId & 0xFFFF);
 
+      case GICR_VSGIPENDR:
+        return vsgiPendingByVpe[residentVpeId & 0xFFFF];
+
+      case GICR_VSGIACTIVER:
+        return vsgiActiveByVpe[residentVpeId & 0xFFFF];
+
       default:
         gic->reserved("Gicv3Redistributor::read(): invalid offset %#x\n", addr);
         return 0; // RES0
@@ -726,6 +732,16 @@ Gicv3Redistributor::write(Addr addr, uint64_t data, size_t size,
         updateDistributor();
         break;
 
+      case GICR_VSGIPENDR:
+        vsgiPendingByVpe[residentVpeId & 0xFFFF] = data & 0xFFFF;
+        directVlpiDirty = true;
+        updateDistributor();
+        break;
+
+      case GICR_VSGIACTIVER:
+        vsgiActiveByVpe[residentVpeId & 0xFFFF] = data & 0xFFFF;
+        break;
+
       case GICR_INVLPIR: { // Redistributor Invalidate LPI Register
           // Do nothing: no caching supported
           break;
@@ -913,6 +929,28 @@ Gicv3Redistributor::refreshDirectVlpi()
     }
 
     directVlpiDirty = false;
+}
+
+void
+Gicv3Redistributor::setVsgiActive(uint16_t vpeid, uint32_t intid)
+{
+    if (intid < 16) {
+        vsgiActiveByVpe[vpeid] |= (1U << intid);
+    }
+}
+
+void
+Gicv3Redistributor::clearVsgiActive(uint16_t vpeid, uint32_t intid)
+{
+    if (intid < 16) {
+        vsgiActiveByVpe[vpeid] &= ~(1U << intid);
+    }
+}
+
+void
+Gicv3Redistributor::markDirectVlpiDirty()
+{
+    directVlpiDirty = true;
 }
 
 /*
@@ -1325,6 +1363,8 @@ Gicv3Redistributor::serialize(CheckpointOut & cp) const
     SERIALIZE_SCALAR(vLpiPendingTablePtr);
     SERIALIZE_SCALAR(vpeResident);
     SERIALIZE_SCALAR(residentVpeId);
+    SERIALIZE_CONTAINER(vsgiPendingByVpe);
+    SERIALIZE_CONTAINER(vsgiActiveByVpe);
     SERIALIZE_SCALAR(directVlpiDirty);
 }
 
@@ -1353,6 +1393,8 @@ Gicv3Redistributor::unserialize(CheckpointIn & cp)
     UNSERIALIZE_SCALAR(vLpiPendingTablePtr);
     UNSERIALIZE_SCALAR(vpeResident);
     UNSERIALIZE_SCALAR(residentVpeId);
+    UNSERIALIZE_CONTAINER(vsgiPendingByVpe);
+    UNSERIALIZE_CONTAINER(vsgiActiveByVpe);
     UNSERIALIZE_SCALAR(directVlpiDirty);
 }
 
