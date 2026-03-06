@@ -952,7 +952,7 @@ ItsCommand::vmapi(Yield &yield, CommandEntry &command)
     itte.intType = Gicv3Its::VIRTUAL_INTERRUPT;
     itte.intNum = command.eventId;
     itte.intNumHyp = command.eventId;
-    itte.vpeid = bits(command.raw[2], 47, 32);
+    itte.vpeid = bits(command.raw[1], 47, 32);
 
     writeIrqTranslationTable(yield, dte.ittAddress, command.eventId, itte);
 }
@@ -986,7 +986,7 @@ ItsCommand::vmapti(Yield &yield, CommandEntry &command)
 
     const uint32_t pintid = bits(command.raw[2], 63, 32);
     const uint32_t vintid = bits(command.raw[2], 31, 0);
-    const uint32_t vpeid = bits(command.raw[2], 47, 32);
+    const uint32_t vpeid = bits(command.raw[1], 47, 32);
 
     if (!dte.valid || idOutOfRange(command, dte) ||
         its.lpiOutOfRange(vintid) || its.lpiOutOfRange(pintid)) {
@@ -1027,7 +1027,7 @@ ItsCommand::vmovi(Yield &yield, CommandEntry &command)
         terminate(yield);
     }
 
-    const auto new_vpe = bits(command.raw[2], 47, 32);
+    const auto new_vpe = bits(command.raw[1], 47, 32);
     itte.vpeid = new_vpe;
 
     writeIrqTranslationTable(yield, dte.ittAddress, command.eventId, itte);

@@ -455,12 +455,14 @@ Gicv3CPUInterface::readMiscReg(int misc_reg)
           uint8_t lr_prio = 0xff;
           bool lr_group1 = false;
           bool lr_can_preempt = false;
+          uint32_t lr_intid = Gicv3::INTID_SPURIOUS;
 
           if (lr_idx >= 0) {
               ICH_LR_EL2 ich_lr_el2 =
                   isa->readMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx);
               lr_prio = ich_lr_el2.Priority;
               lr_group1 = ich_lr_el2.Group;
+              lr_intid = ich_lr_el2.vINTID;
               lr_can_preempt = hppviCanPreempt(lr_idx);
           }
 
@@ -473,10 +475,12 @@ Gicv3CPUInterface::readMiscReg(int misc_reg)
               direct_valid && (hppvi_direct.group == Gicv3::G0S);
           uint8_t direct_prio = direct_valid ? hppvi_direct.prio : 0xff;
 
+          bool direct_wins_tie = lr_group1 || (hppvi_direct.intid < lr_intid);
           bool direct_is_highest = direct_group0 &&
-              (direct_prio < lr_prio || (direct_prio == lr_prio && lr_group1));
+              (direct_prio < lr_prio || (direct_prio == lr_prio && direct_wins_tie));
           bool lr_is_highest = lr_can_preempt && !lr_group1 &&
-              (lr_prio < direct_prio || (lr_prio == direct_prio && !direct_group0));
+              (lr_prio < direct_prio ||
+               (lr_prio == direct_prio && !direct_wins_tie));
 
           uint32_t int_id = Gicv3::INTID_SPURIOUS;
 
@@ -553,12 +557,14 @@ Gicv3CPUInterface::readMiscReg(int misc_reg)
           uint8_t lr_prio = 0xff;
           bool lr_group1 = false;
           bool lr_can_preempt = false;
+          uint32_t lr_intid = Gicv3::INTID_SPURIOUS;
 
           if (lr_idx >= 0) {
               ICH_LR_EL2 ich_lr_el2 =
                   isa->readMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx);
               lr_prio = ich_lr_el2.Priority;
               lr_group1 = ich_lr_el2.Group;
+              lr_intid = ich_lr_el2.vINTID;
               lr_can_preempt = hppviCanPreempt(lr_idx);
           }
 
@@ -567,11 +573,17 @@ Gicv3CPUInterface::readMiscReg(int misc_reg)
           }
 
           const bool direct_valid = hppviDirectCanPreempt();
+          const bool direct_group1 =
+              direct_valid && (hppvi_direct.group == Gicv3::G1NS);
           uint8_t direct_prio = direct_valid ? hppvi_direct.prio : 0xff;
 
-          bool direct_is_highest = direct_valid &&
-              (direct_prio < lr_prio || (direct_prio == lr_prio && lr_group1));
-          bool lr_is_highest = lr_can_preempt && (lr_prio < direct_prio || (lr_prio == direct_prio && !lr_group1));
+          bool direct_wins_tie = lr_group1 && (hppvi_direct.intid < lr_intid);
+          bool direct_is_highest = direct_group1 &&
+              (direct_prio < lr_prio ||
+               (direct_prio == lr_prio && direct_wins_tie));
+          bool lr_is_highest = lr_can_preempt && lr_group1 &&
+              (lr_prio < direct_prio ||
+               (lr_prio == direct_prio && !direct_wins_tie));
 
           uint32_t int_id = Gicv3::INTID_SPURIOUS;
 
@@ -2260,6 +2272,7 @@ Gicv3CPUInterface::virtualUpdate()
     bool lr_valid = false;
     uint8_t lr_prio = 0xff;
     bool lr_group1 = true;
+    uint32_t lr_intid = Gicv3::INTID_SPURIOUS;
 
     if (lr_idx >= 0) {
         ICH_LR_EL2 ich_lr_el2 =
@@ -2268,15 +2281,34 @@ Gicv3CPUInterface::virtualUpdate()
             lr_valid = true;
             lr_prio = ich_lr_el2.Priority;
             lr_group1 = ich_lr_el2.Group;
+            lr_intid = ich_lr_el2.vINTID;
         }
     }
 
     const bool direct_valid = hppviDirectCanPreempt();
-    const bool direct_wins = direct_valid &&
-        (!lr_valid || (hppvi_direct.prio < lr_prio) || (hppvi_direct.prio == lr_prio && lr_group1));
+    bool direct_wins = false;
+    if (direct_valid) {
+        if (!lr_valid) {
+            direct_wins = true;
+        } else if (hppvi_direct.prio < lr_prio) {
+            direct_wins = true;
+        } else if (hppvi_direct.prio == lr_prio) {
+            bool direct_grp0 = (hppvi_direct.group == Gicv3::G0S);
+            bool lr_grp0 = !lr_group1;
+            if (direct_grp0 && !lr_grp0) {
+                direct_wins = true;
+            } else if (direct_grp0 == lr_grp0) {
+                direct_wins = (hppvi_direct.intid < lr_intid);
+            }
+        }
+    }
 
     if (direct_wins) {
-        signal_IRQ = true;
+        if (hppvi_direct.group == Gicv3::G0S) {
+            signal_FIQ = true;
+        } else {
+            signal_IRQ = true;
+        }
     } else if (lr_valid) {
         if (lr_group1) {
             signal_IRQ = true;
