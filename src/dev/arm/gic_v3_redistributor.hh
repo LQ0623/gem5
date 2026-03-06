@@ -41,6 +41,7 @@
 #ifndef __DEV_ARM_GICV3_REDISTRIBUTOR_H__
 #define __DEV_ARM_GICV3_REDISTRIBUTOR_H__
 
+#include <array>
 #include <map>
 
 #include "base/addr_range.hh"
@@ -167,10 +168,10 @@ class Gicv3Redistributor : public Serializable
         GICR_VPROPBASER = VLPI_base + 0x0070,
         // Redistributor Virtual Pending Table Base Address Register
         GICR_VPENDBASER = VLPI_base + 0x0078,
-        // Redistributor Virtual SGI Pending Register
+        // Redistributor Virtual SGI Query Register
+        GICR_VSGIR = VLPI_base + 0x0080,
+        // Redistributor Virtual SGI Pending Register (RO)
         GICR_VSGIPENDR = VLPI_base + 0x0088,
-        // Redistributor Virtual SGI Active Register
-        GICR_VSGIACTIVER = VLPI_base + 0x0090,
     };
 
     std::vector <uint8_t> irqGroup;
@@ -200,9 +201,11 @@ class Gicv3Redistributor : public Serializable
     bool vpeResident;
     uint32_t residentVpeId;
 
-    // GICv4.1: vSGI state is architectural state, not vPT memory.
+    // GICv4.1: vSGI pending and config are architectural state in GIC.
+    // Each config byte follows the LPI format: bit[0]=enable, bit[7:2]=priority.
     std::map<uint16_t, uint16_t> vsgiPendingByVpe;
-    std::map<uint16_t, uint16_t> vsgiActiveByVpe;
+    std::map<uint16_t, std::array<uint8_t, 16>> vsgiConfigByVpe;
+    uint16_t queriedVpeId;
 
     // Track whether vLPI direct-injection candidate needs refresh.
     bool directVlpiDirty;
@@ -290,8 +293,9 @@ class Gicv3Redistributor : public Serializable
     void refreshDirectVlpi();
 
   public:
-    void setVsgiActive(uint16_t vpeid, uint32_t intid);
-    void clearVsgiActive(uint16_t vpeid, uint32_t intid);
+    void setVsgiConfig(uint16_t vpeid, uint32_t intid, bool enable, uint8_t prio);
+    void clearVsgiPending(uint16_t vpeid, uint32_t intid);
+    void migrateVpeVsgiState(uint16_t vpeid, Gicv3Redistributor *new_rd);
     void markDirectVlpiDirty();
 
     Gicv3Redistributor(Gicv3 * gic, uint32_t cpu_id);

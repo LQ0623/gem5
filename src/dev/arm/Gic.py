@@ -320,6 +320,7 @@ class Gicv3(BaseGic):
     )
 
     gicv4 = Param.Bool(False, "GIC is GICv4 compatible")
+    gicv4_1 = Param.Bool(False, "GIC is GICv4.1 compatible")
 
     enable_1ofn_rr = Param.Bool(False, "Using a polling algorithm")
 

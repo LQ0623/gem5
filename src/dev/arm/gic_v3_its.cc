@@ -441,6 +441,7 @@ ItsCommand::DispatchTable ItsCommand::cmdDispatcher =
     COMMAND(VMOVI, &ItsCommand::vmovi),
     COMMAND(VMOVP, &ItsCommand::vmovp),
     COMMAND(VSYNC, &ItsCommand::vsync),
+    COMMAND(VSGI, &ItsCommand::vsgi),
 };
 
 ItsCommand::ItsCommand(Gicv3Its &_its)
@@ -1044,6 +1045,12 @@ ItsCommand::vmovp(Yield &yield, CommandEntry &command)
         return;
     }
 
+    auto *old_rd = its.getRedistributor(vpete.rdBase);
+    auto *new_rd = its.getRedistributor(rd_base);
+    if (old_rd && new_rd && old_rd != new_rd) {
+        old_rd->migrateVpeVsgiState(vpe_id & 0xFFFF, new_rd);
+    }
+
     vpete.rdBase = rd_base;
     writeVpeTable(yield, vpe_id, vpete);
 }
@@ -1056,6 +1063,45 @@ ItsCommand::vsync(Yield &yield, CommandEntry &command)
     // No op while no virtual caching model is present.
 }
 
+void
+ItsCommand::vsgi(Yield &yield, CommandEntry &command)
+{
+    (void)yield;
+
+    const uint16_t vpe_id = bits(command.raw[1], 47, 32);
+    const uint32_t vintid = bits(command.raw[2], 31, 0);
+    const bool clear = bits(command.raw[2], 63, 63);
+    const bool enable = bits(command.raw[3], 0, 0);
+    const uint8_t prio = bits(command.raw[3], 7, 2);
+
+    if (vintid >= 16) {
+        return;
+    }
+
+    its.markVpeDirty(vpe_id);
+    for (int i = 0; i < its.gic->getSystem()->threads.size(); i++) {
+        auto *rd = its.gic->getRedistributor(i);
+        if (rd->vpeResident && ((rd->residentVpeId & 0xFFFF) == vpe_id)) {
+            if (clear) {
+                rd->clearVsgiPending(vpe_id, vintid);
+            } else {
+                rd->setVsgiConfig(vpe_id, vintid, enable, prio);
+            }
+            return;
+        }
+    }
+
+    // Non-resident vPE: update state on bound RD from VPETE routing.
+    VPETE vpete;
+    if (its.readVpe(vpe_id, vpete) && vpete.valid) {
+        auto *rd = its.getRedistributor(vpete.rdBase);
+        if (clear) {
+            rd->clearVsgiPending(vpe_id, vintid);
+        } else {
+            rd->setVsgiConfig(vpe_id, vintid, enable, prio);
+        }
+    }
+}
 
 Gicv3Its::Gicv3Its(const Gicv3ItsParams &params)
  : BasicPioDevice(params, params.pio_size),

@@ -84,6 +84,7 @@ Gicv3Redistributor::Gicv3Redistributor(Gicv3 * gic, uint32_t cpu_id)
       vpeResident(false),
       residentVpeId(0),
       directVlpiDirty(true),
+      queriedVpeId(0),
       addrRangeSize(gic->params().gicv4 ? 0x40000 : 0x20000)
 {
 }
@@ -389,19 +390,15 @@ Gicv3Redistributor::read(Addr addr, size_t size, bool is_secure_access)
         return vLpiConfigurationTablePtr | vLpiIDBits;
 
       case GICR_VPENDBASER:
-        return ((uint64_t)vpeResident << 63) | (residentVpeId & 0xFFFF);
+        if (gic->params().gicv4_1) {
+            // GICv4.1: bit[62] IDAI is modeled as 0 (no asynchronous invalidation).
+            return ((uint64_t)vpeResident << 63) | (residentVpeId & 0xFFFF);
+        }
+        return vLpiPendingTablePtr;
 
       case GICR_VSGIPENDR:
-        if (!vpeResident) {
-            return 0;
-        }
-        return vsgiPendingByVpe[residentVpeId & 0xFFFF];
-
-      case GICR_VSGIACTIVER:
-        if (!vpeResident) {
-            return 0;
-        }
-        return vsgiActiveByVpe[residentVpeId & 0xFFFF];
+        // Busy bit [31] is returned as 0 (query complete).
+        return vsgiPendingByVpe[queriedVpeId & 0xFFFF];
 
       default:
         gic->reserved("Gicv3Redistributor::read(): invalid offset %#x\n", addr);
@@ -731,28 +728,27 @@ Gicv3Redistributor::write(Addr addr, uint64_t data, size_t size,
       }
 
       case GICR_VPENDBASER:
-        // GICv4.1: [51:16] are RES0. vPT base comes from ITS VMAPP(VPETE).
-        vLpiPendingTablePtr = 0;
-        vpeResident = (data & (1ULL << 63)) != 0;
-        residentVpeId = data & 0xFFFF;
+        if (gic->params().gicv4_1) {
+            // GICv4.1: [51:16] are RES0. vPT base comes from ITS VMAPP(VPETE).
+            vLpiPendingTablePtr = 0;
+            vpeResident = (data & (1ULL << 63)) != 0;
+            residentVpeId = data & 0xFFFF;
+        } else {
+            // GICv4.0: pending table address is carried in VPENDBASER.
+            vLpiPendingTablePtr = data & 0xFFFFFFFFF0000ULL;
+            vpeResident = (data & (1ULL << 63)) != 0;
+            residentVpeId = data & 0xFFFF;
+        }
         directVlpiDirty = true;
         updateDistributor();
+        break;
+
+      case GICR_VSGIR:
+        queriedVpeId = data & 0xFFFF;
         break;
 
       case GICR_VSGIPENDR:
-        if (!vpeResident) {
-            return;
-        }
-        vsgiPendingByVpe[residentVpeId & 0xFFFF] = data & 0xFFFF;
-        directVlpiDirty = true;
-        updateDistributor();
-        break;
-
-      case GICR_VSGIACTIVER:
-        if (!vpeResident) {
-            return;
-        }
-        vsgiActiveByVpe[residentVpeId & 0xFFFF] = data & 0xFFFF;
+        // RO register.
         break;
 
       case GICR_INVLPIR: { // Redistributor Invalidate LPI Register
@@ -887,21 +883,18 @@ Gicv3Redistributor::refreshDirectVlpi()
     const uint16_t vpeid16 = residentVpeId & 0xFFFF;
     const uint16_t vsgi_pending =
         vsgiPendingByVpe.count(vpeid16) ? vsgiPendingByVpe[vpeid16] : 0;
-    const uint16_t vsgi_active =
-        vsgiActiveByVpe.count(vpeid16) ? vsgiActiveByVpe[vpeid16] : 0;
-    const uint16_t vsgi_eval = vsgi_pending & ~vsgi_active;
 
-    uint8_t vsgi_config[16] = {0};
-    if (vLpiConfigurationTablePtr) {
-        memProxy->readBlob(vLpiConfigurationTablePtr, vsgi_config, 16);
+    auto cfg_it = vsgiConfigByVpe.find(vpeid16);
+    if (cfg_it == vsgiConfigByVpe.end()) {
+        cfg_it = vsgiConfigByVpe.emplace(vpeid16, std::array<uint8_t, 16>{}).first;
     }
 
     for (uint32_t sgi_id = 0; sgi_id < 16; sgi_id++) {
-        if ((vsgi_eval & (1U << sgi_id)) == 0) {
+        if ((vsgi_pending & (1U << sgi_id)) == 0) {
             continue;
         }
 
-        LPIConfigurationTableEntry config = vsgi_config[sgi_id];
+        LPIConfigurationTableEntry config = cfg_it->second[sgi_id];
         if (!config.enable) {
             continue;
         }
@@ -958,26 +951,66 @@ Gicv3Redistributor::refreshDirectVlpi()
 }
 
 void
-Gicv3Redistributor::setVsgiActive(uint16_t vpeid, uint32_t intid)
+Gicv3Redistributor::setVsgiConfig(
+    uint16_t vpeid, uint32_t intid, bool enable, uint8_t prio)
 {
-    if (intid < 16) {
-        vsgiActiveByVpe[vpeid] |= (1U << intid);
-        if (vpeResident && (residentVpeId & 0xFFFF) == vpeid) {
-            directVlpiDirty = true;
-            updateDistributor();
-        }
+    if (intid >= 16) {
+        return;
+    }
+
+    auto &cfg = vsgiConfigByVpe[vpeid];
+    LPIConfigurationTableEntry entry = cfg[intid];
+    entry.enable = enable;
+    entry.priority = (prio >> 2);
+    cfg[intid] = entry;
+
+    if (vpeResident && (residentVpeId & 0xFFFF) == vpeid) {
+        directVlpiDirty = true;
+        updateDistributor();
     }
 }
 
 void
-Gicv3Redistributor::clearVsgiActive(uint16_t vpeid, uint32_t intid)
+Gicv3Redistributor::clearVsgiPending(uint16_t vpeid, uint32_t intid)
 {
-    if (intid < 16) {
-        vsgiActiveByVpe[vpeid] &= ~(1U << intid);
-        if (vpeResident && (residentVpeId & 0xFFFF) == vpeid) {
-            directVlpiDirty = true;
-            updateDistributor();
-        }
+    if (intid >= 16) {
+        return;
+    }
+
+    vsgiPendingByVpe[vpeid] &= ~(1U << intid);
+    if (vpeResident && (residentVpeId & 0xFFFF) == vpeid) {
+        directVlpiDirty = true;
+        updateDistributor();
+    }
+}
+
+void
+Gicv3Redistributor::migrateVpeVsgiState(
+    uint16_t vpeid, Gicv3Redistributor *new_rd)
+{
+    if (!new_rd || new_rd == this) {
+        return;
+    }
+
+    auto pend_it = vsgiPendingByVpe.find(vpeid);
+    if (pend_it != vsgiPendingByVpe.end()) {
+        new_rd->vsgiPendingByVpe[vpeid] = pend_it->second;
+        vsgiPendingByVpe.erase(pend_it);
+    }
+
+    auto cfg_it = vsgiConfigByVpe.find(vpeid);
+    if (cfg_it != vsgiConfigByVpe.end()) {
+        new_rd->vsgiConfigByVpe[vpeid] = cfg_it->second;
+        vsgiConfigByVpe.erase(cfg_it);
+    }
+
+    if (vpeResident && (residentVpeId & 0xFFFF) == vpeid) {
+        directVlpiDirty = true;
+        updateDistributor();
+    }
+    if (new_rd->vpeResident && (new_rd->residentVpeId & 0xFFFF) == vpeid) {
+        new_rd->directVlpiDirty = true;
+        new_rd->updateDistributor();
     }
 }
 
@@ -1025,7 +1058,7 @@ Gicv3Redistributor::update()
         // 中文说明：避免 largest_lpi_id 小于最小 LPI 编号时发生无符号下溢。
         if (largest_lpi_id >= SMALLEST_LPI_ID) {
             const uint32_t number_lpis =
-                largest_lpi_id - SMALLEST_LPI_ID + 1;
+                largest_lpi_id - SMALLEST_LPI_ID;
             const size_t table_size = largest_lpi_id / 8;
             auto lpi_pending_table = std::make_unique<uint8_t[]>(table_size);
             auto lpi_config_table = std::make_unique<uint8_t[]>(number_lpis);
@@ -1229,7 +1262,26 @@ Gicv3Redistributor::setClrVLPI(uint32_t vintid, uint32_t vpeid,
         }
 
         if (is_resident) {
-            directVlpiDirty = true;
+            if (set) {
+                auto cfg_it = vsgiConfigByVpe.find(vpeid16);
+                if (cfg_it != vsgiConfigByVpe.end()) {
+                    LPIConfigurationTableEntry cfg = cfg_it->second[vintid];
+                    if (!cfg.enable) {
+                        updateDistributor();
+                        return;
+                    }
+                    const uint8_t prio = cfg.priority << 2;
+                    if ((prio < cpuInterface->hppvi_direct.prio) ||
+                        (prio == cpuInterface->hppvi_direct.prio &&
+                         vintid < cpuInterface->hppvi_direct.intid)) {
+                        cpuInterface->hppvi_direct.intid = vintid;
+                        cpuInterface->hppvi_direct.prio = prio;
+                        cpuInterface->hppvi_direct.group = Gicv3::G1NS;
+                    }
+                }
+            } else if (cpuInterface->hppvi_direct.intid == vintid) {
+                directVlpiDirty = true;
+            }
             updateDistributor();
         }
         return;
@@ -1265,7 +1317,24 @@ Gicv3Redistributor::setClrVLPI(uint32_t vintid, uint32_t vpeid,
     memProxy->writeBlob(entry_ptr, &entry, sizeof(entry));
 
     if (is_resident) {
-        directVlpiDirty = true;
+        if (set) {
+            uint8_t cfg_raw = 0;
+            const Addr cfg_ptr = vLpiConfigurationTablePtr + vintid;
+            memProxy->readBlob(cfg_ptr, &cfg_raw, sizeof(cfg_raw));
+            LPIConfigurationTableEntry cfg = cfg_raw;
+            if (cfg.enable) {
+                const uint8_t prio = cfg.priority << 2;
+                if ((prio < cpuInterface->hppvi_direct.prio) ||
+                    (prio == cpuInterface->hppvi_direct.prio &&
+                     vintid < cpuInterface->hppvi_direct.intid)) {
+                    cpuInterface->hppvi_direct.intid = vintid;
+                    cpuInterface->hppvi_direct.prio = prio;
+                    cpuInterface->hppvi_direct.group = Gicv3::G1NS;
+                }
+            }
+        } else if (cpuInterface->hppvi_direct.intid == vintid) {
+            directVlpiDirty = true;
+        }
         updateDistributor();
     }
 }
@@ -1398,7 +1467,8 @@ Gicv3Redistributor::serialize(CheckpointOut & cp) const
     SERIALIZE_SCALAR(vpeResident);
     SERIALIZE_SCALAR(residentVpeId);
     SERIALIZE_CONTAINER(vsgiPendingByVpe);
-    SERIALIZE_CONTAINER(vsgiActiveByVpe);
+    SERIALIZE_CONTAINER(vsgiConfigByVpe);
+    SERIALIZE_SCALAR(queriedVpeId);
     SERIALIZE_SCALAR(directVlpiDirty);
 }
 
@@ -1428,7 +1498,8 @@ Gicv3Redistributor::unserialize(CheckpointIn & cp)
     UNSERIALIZE_SCALAR(vpeResident);
     UNSERIALIZE_SCALAR(residentVpeId);
     UNSERIALIZE_CONTAINER(vsgiPendingByVpe);
-    UNSERIALIZE_CONTAINER(vsgiActiveByVpe);
+    UNSERIALIZE_CONTAINER(vsgiConfigByVpe);
+    UNSERIALIZE_SCALAR(queriedVpeId);
     UNSERIALIZE_SCALAR(directVlpiDirty);
 }
 

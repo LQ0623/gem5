@@ -489,7 +489,8 @@ class ItsCommand : public ItsProcess
         VMAPTI = 0x2A,
         VMOVI = 0x21,
         VMOVP = 0x22,
-        VSYNC = 0x25
+        VSYNC = 0x25,
+        VSGI = 0x2E
     };
 
     ItsCommand(Gicv3Its &_its);
@@ -545,6 +546,7 @@ class ItsCommand : public ItsProcess
     void vmovi(Yield &yield, CommandEntry &command);
     void vmovp(Yield &yield, CommandEntry &command);
     void vsync(Yield &yield, CommandEntry &command);
+    void vsgi(Yield &yield, CommandEntry &command);
 
   protected: // Helpers
     bool idOutOfRange(CommandEntry &command, DTE dte) const

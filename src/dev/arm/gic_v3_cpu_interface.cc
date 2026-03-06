@@ -503,10 +503,6 @@ Gicv3CPUInterface::readMiscReg(int misc_reg)
               redistributor->setClrVLPI(clr_intid,
                                         redistributor->residentVpeId,
                                         0, false);
-              if (clr_intid < 16) {
-                  redistributor->setVsgiActive(
-                      redistributor->residentVpeId & 0xFFFF, clr_intid);
-              }
           } else if (lr_is_highest) {
               ICH_LR_EL2 ich_lr_el2 =
                   isa->readMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx);
@@ -608,10 +604,6 @@ Gicv3CPUInterface::readMiscReg(int misc_reg)
               redistributor->setClrVLPI(clr_intid,
                                         redistributor->residentVpeId,
                                         0, false);
-              if (clr_intid < 16) {
-                  redistributor->setVsgiActive(
-                      redistributor->residentVpeId & 0xFFFF, clr_intid);
-              }
           } else if (lr_is_highest && lr_group1) {
               ICH_LR_EL2 ich_lr_el2 =
                   isa->readMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx);
@@ -1055,10 +1047,6 @@ Gicv3CPUInterface::setMiscReg(int misc_reg, RegVal val)
           if (lr_idx < 0) {
               ICH_HCR_EL2 ich_hcr = isa->readMiscRegNoEffect(MISCREG_ICH_HCR_EL2);
               if (int_id < 16 && ich_hcr.TC == 0) {
-                  if (!virtualIsEOISplitMode()) {
-                      redistributor->clearVsgiActive(
-                          redistributor->residentVpeId & 0xFFFF, int_id);
-                  }
                   // Direct vSGIs are not in the List Registers; do not increment EOIcount
                   DPRINTF(GIC, "vSGI: Direct EOI without LR.\n");
               } else if (int_id < Gicv3Redistributor::SMALLEST_LPI_ID) {
@@ -1184,8 +1172,6 @@ Gicv3CPUInterface::setMiscReg(int misc_reg, RegVal val)
           if (lr_idx < 0) {
               ICH_HCR_EL2 ich_hcr = isa->readMiscRegNoEffect(MISCREG_ICH_HCR_EL2);
               if (int_id < 16 && ich_hcr.TC == 0) {
-                  redistributor->clearVsgiActive(
-                      redistributor->residentVpeId & 0xFFFF, int_id);
                   DPRINTF(GIC, "vSGI: Direct DIR without LR.\n");
               }
           } else {
@@ -2916,7 +2902,10 @@ Gicv3CPUInterface::generateVSGI(RegVal val, Gicv3::GroupId group)
         }
 
         if (!target_redist) {
-            target_redist = redistributor;
+            target_redist = gic->its->getRedistributor(vpete.rdBase);
+        }
+        if (!target_redist) {
+            return;
         }
 
         DPRINTF(GIC, "vSGI: Direct injecting INTID %d to vPE %d\n",
