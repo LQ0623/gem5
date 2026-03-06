@@ -887,13 +887,26 @@ Gicv3Redistributor::refreshDirectVlpi()
     const uint16_t vpeid16 = residentVpeId & 0xFFFF;
     const uint16_t vsgi_pending =
         vsgiPendingByVpe.count(vpeid16) ? vsgiPendingByVpe[vpeid16] : 0;
+    const uint16_t vsgi_active =
+        vsgiActiveByVpe.count(vpeid16) ? vsgiActiveByVpe[vpeid16] : 0;
+    const uint16_t vsgi_eval = vsgi_pending & ~vsgi_active;
+
+    uint8_t vsgi_config[16] = {0};
+    if (vLpiConfigurationTablePtr) {
+        memProxy->readBlob(vLpiConfigurationTablePtr, vsgi_config, 16);
+    }
 
     for (uint32_t sgi_id = 0; sgi_id < 16; sgi_id++) {
-        if ((vsgi_pending & (1U << sgi_id)) == 0) {
+        if ((vsgi_eval & (1U << sgi_id)) == 0) {
             continue;
         }
 
-        const uint8_t prio = 0xa0;
+        LPIConfigurationTableEntry config = vsgi_config[sgi_id];
+        if (!config.enable) {
+            continue;
+        }
+
+        const uint8_t prio = config.priority << 2;
         if ((prio < cpuInterface->hppvi_direct.prio) ||
             (prio == cpuInterface->hppvi_direct.prio &&
              sgi_id < cpuInterface->hppvi_direct.intid)) {
@@ -949,6 +962,10 @@ Gicv3Redistributor::setVsgiActive(uint16_t vpeid, uint32_t intid)
 {
     if (intid < 16) {
         vsgiActiveByVpe[vpeid] |= (1U << intid);
+        if (vpeResident && (residentVpeId & 0xFFFF) == vpeid) {
+            directVlpiDirty = true;
+            updateDistributor();
+        }
     }
 }
 
@@ -957,6 +974,10 @@ Gicv3Redistributor::clearVsgiActive(uint16_t vpeid, uint32_t intid)
 {
     if (intid < 16) {
         vsgiActiveByVpe[vpeid] &= ~(1U << intid);
+        if (vpeResident && (residentVpeId & 0xFFFF) == vpeid) {
+            directVlpiDirty = true;
+            updateDistributor();
+        }
     }
 }
 

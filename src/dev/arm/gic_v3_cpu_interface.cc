@@ -970,11 +970,9 @@ Gicv3CPUInterface::setMiscReg(int misc_reg, RegVal val)
           if (lr_idx < 0) {
               ICH_HCR_EL2 ich_hcr = isa->readMiscRegNoEffect(MISCREG_ICH_HCR_EL2);
               if (int_id < 16 && ich_hcr.TC == 0) {
-                  if (!virtualIsEOISplitMode()) {
-                      redistributor->clearVsgiActive(
-                          redistributor->residentVpeId & 0xFFFF, int_id);
-                  }
-                  DPRINTF(GIC, "vSGI: Direct EOI without LR.\n");
+                  DPRINTF(GIC,
+                          "vSGI: Ignored direct EOI on EOIR0 "
+                          "(vSGI is always Group 1).\n");
               } else if (int_id < Gicv3Redistributor::SMALLEST_LPI_ID) {
                   virtualIncrementEOICount();
               }
@@ -1188,9 +1186,7 @@ Gicv3CPUInterface::setMiscReg(int misc_reg, RegVal val)
               if (int_id < 16 && ich_hcr.TC == 0) {
                   redistributor->clearVsgiActive(
                       redistributor->residentVpeId & 0xFFFF, int_id);
-                  DPRINTF(GIC, "vSGI: Direct DIR without LR. Ignoring EOIcount.\n");
-              } else if (int_id < Gicv3Redistributor::SMALLEST_LPI_ID) {
-                  virtualIncrementEOICount();
+                  DPRINTF(GIC, "vSGI: Direct DIR without LR.\n");
               }
           } else {
               virtualDeactivateIRQ(lr_idx);

@@ -951,7 +951,7 @@ ItsCommand::vmapi(Yield &yield, CommandEntry &command)
     itte.valid = 1;
     itte.intType = Gicv3Its::VIRTUAL_INTERRUPT;
     itte.intNum = command.eventId;
-    itte.intNumHyp = command.eventId;
+    itte.intNumHyp = bits(command.raw[2], 63, 32);
     itte.vpeid = bits(command.raw[1], 47, 32);
 
     writeIrqTranslationTable(yield, dte.ittAddress, command.eventId, itte);
