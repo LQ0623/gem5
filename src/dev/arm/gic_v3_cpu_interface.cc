@@ -2245,10 +2245,15 @@ Gicv3CPUInterface::virtualUpdate()
     const bool maint_pending = redistributor->irqPending[
         maintenanceInterrupt->num()];
 
-    if (ich_hcr_el2.En && !maint_pending && maintenanceInterruptStatus()) {
-        maintenanceInterrupt->raise();
-    } else if (maint_pending) {
-        maintenanceInterrupt->clear();
+    const bool misr_active = (maintenanceInterruptStatus() != 0);
+    if (ich_hcr_el2.En && misr_active) {
+        if (!maint_pending) {
+            maintenanceInterrupt->raise();
+        }
+    } else {
+        if (maint_pending) {
+            maintenanceInterrupt->clear();
+        }
     }
 
     if (signal_IRQ) {
@@ -2868,8 +2873,10 @@ Gicv3CPUInterface::generateVSGI(RegVal val, Gicv3::GroupId group)
         }
 
         const uint32_t aff0 = rs * 16 + target_idx;
-        const uint32_t target_vpeid =
+        const uint32_t virtual_affinity =
             (aff3 << 24) | (aff2 << 16) | (aff1 << 8) | aff0;
+        // HACK: model-specific collapse from virtual affinity to 16-bit vPEID.
+        const uint16_t target_vpeid = virtual_affinity & 0xFFFF;
         injectVpe(target_vpeid);
     }
 }
@@ -2914,6 +2921,8 @@ Gicv3CPUInterface::simulateHypervisorTrap(RegVal val, Gicv3::GroupId group)
                 // [CRITICAL FIX] Clear entire union to wipe dirty HW/pINTID bits from previous IRQs
                 ich_lr_el2 = 0;
 
+                // HACK: This bypasses architectural EL2 trap delivery and
+                // writes LR state directly in the model.
                 ich_lr_el2.State = ICH_LR_EL2_STATE_PENDING;
                 ich_lr_el2.vINTID = int_id;
                 ich_lr_el2.Priority = 0xa0; // Default virtual priority for trap

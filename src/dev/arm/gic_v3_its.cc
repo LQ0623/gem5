@@ -993,7 +993,7 @@ ItsCommand::vmapti(Yield &yield, CommandEntry &command)
 
     DTE dte = readDeviceTable(yield, command.deviceId);
 
-    const uint32_t pintid = bits(command.raw[3], 31, 0);
+    const uint32_t pintid = bits(command.raw[3], 63, 32);
     const uint32_t vintid = bits(command.raw[2], 31, 0);
     const uint32_t vpeid = bits(command.raw[2], 47, 32);
 
@@ -1036,7 +1036,7 @@ ItsCommand::vmovi(Yield &yield, CommandEntry &command)
         terminate(yield);
     }
 
-    const auto new_vpe = bits(command.raw[2], 15, 0);
+    const auto new_vpe = bits(command.raw[2], 47, 32);
     itte.vpeid = new_vpe;
 
     writeIrqTranslationTable(yield, dte.ittAddress, command.eventId, itte);
@@ -1046,7 +1046,7 @@ void
 ItsCommand::vmovp(Yield &yield, CommandEntry &command)
 {
     const uint32_t vpe_id = bits(command.raw[1], 47, 32);
-    const uint64_t rd_base = bits(command.raw[3], 50, 16);
+    const uint64_t rd_base = bits(command.raw[2], 51, 16);
 
     VPETE vpete = readVpeTable(yield, vpe_id);
     if (!vpete.valid) {

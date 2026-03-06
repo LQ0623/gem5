@@ -41,6 +41,8 @@
 #ifndef __DEV_ARM_GICV3_REDISTRIBUTOR_H__
 #define __DEV_ARM_GICV3_REDISTRIBUTOR_H__
 
+#include <unordered_map>
+
 #include "base/addr_range.hh"
 #include "dev/arm/gic_v3.hh"
 #include "sim/serialize.hh"
@@ -194,6 +196,12 @@ class Gicv3Redistributor : public Serializable
     bool vpeResident;
     uint32_t residentVpeId;
 
+    // GICv4.1: vSGI pending state is architectural state, not vPT memory.
+    std::unordered_map<uint16_t, uint16_t> vsgiPendingByVpe;
+
+    // Track whether vLPI direct-injection candidate needs refresh.
+    bool directVlpiDirty;
+
     BitUnion8(LPIConfigurationTableEntry)
         Bitfield<7, 2> priority;
         Bitfield<1> res1;
@@ -272,6 +280,9 @@ class Gicv3Redistributor : public Serializable
     {
         return !isLevelSensitive(int_id) || irqPendingIspendr[int_id];
     }
+
+    Addr residentVptBase() const;
+    void refreshDirectVlpi();
 
   public:
 
