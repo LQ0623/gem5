@@ -129,7 +129,10 @@ Gicv3Registers::clearDistRange(Gicv3Registers *to, Addr daddr, size_t size)
 
 
 Gicv3::Gicv3(const Params &p)
-    : BaseGic(p)
+    : BaseGic(p),
+      distributor(nullptr),
+      its(p.its),
+      redistSize(0)
 {
 }
 
@@ -164,8 +167,6 @@ Gicv3::init()
         redistributors[i]->init();
         cpuInterfaces[i]->init();
     }
-
-    Gicv3Its *its = params().its;
     if (its)
         its->setGIC(this);
 

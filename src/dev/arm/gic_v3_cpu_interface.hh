@@ -356,6 +356,10 @@ class Gicv3CPUInterface : public ArmISA::BaseISADevice, public Serializable
     void assertWakeRequest(void);
     void deassertWakeRequest(void);
 
+    bool injectVirtualLPI(uint32_t intid, uint8_t priority,
+                          Gicv3::GroupId group = Gicv3::G1NS);
+    bool clearPendingVirtualLPI(uint32_t intid);
+
     RegVal readBankedMiscReg(ArmISA::MiscRegIndex misc_reg) const;
     void setBankedMiscReg(ArmISA::MiscRegIndex misc_reg, RegVal val) const;
   public:

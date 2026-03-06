@@ -39,12 +39,14 @@
  */
 
 #include "dev/arm/gic_v3_redistributor.hh"
+#include <algorithm>
 
 #include "arch/arm/utility.hh"
 #include "base/compiler.hh"
 #include "debug/GIC.hh"
 #include "dev/arm/gic_v3_cpu_interface.hh"
 #include "dev/arm/gic_v3_distributor.hh"
+#include "dev/arm/gic_v3_its.hh"
 
 namespace gem5
 {
@@ -80,6 +82,9 @@ Gicv3Redistributor::Gicv3Redistributor(Gicv3 * gic, uint32_t cpu_id)
       vLpiConfigurationTablePtr(0),
       vLpiIDBits(0),
       vLpiPendingTablePtr(0),
+      vLpiPendingTableValid(false),
+      residentVpeId(0xffff),
+      residentVptAddr(0),
       addrRangeSize(gic->params().gicv4 ? 0x40000 : 0x20000)
 {
 }
@@ -169,9 +174,10 @@ Gicv3Redistributor::read(Addr addr, size_t size, bool is_secure_access)
            */
           uint64_t affinity = getAffinity();
           int last = cpuId == (gic->getSystem()->threads.size() - 1);
-          uint64_t vlpis = gic->params().gicv4 ? (1 << 1) : 0;
+          const uint64_t vlpis = gic->params().gicv4 ? (1 << 1) : 0;
+          const uint64_t directLpi = gic->params().gicv4 ? (1 << 3) : 0;
           return (affinity << 32) | (1 << 24) | (cpuId << 8) |
-              (1 << 5) | (last << 4) | (1 << 3) | vlpis | (1 << 0);
+              (1 << 5) | (last << 4) | directLpi | vlpis | (1 << 0);
       }
 
       case GICR_WAKER: // Wake Register
@@ -384,7 +390,8 @@ Gicv3Redistributor::read(Addr addr, size_t size, bool is_secure_access)
         return vLpiConfigurationTablePtr | vLpiIDBits;
 
       case GICR_VPENDBASER:
-        return vLpiPendingTablePtr;
+        return vLpiPendingTablePtr |
+            (vLpiPendingTableValid ? (1ULL << 63) : 0);
 
       default:
         gic->reserved("Gicv3Redistributor::read(): invalid offset %#x\n", addr);
@@ -709,11 +716,25 @@ Gicv3Redistributor::write(Addr addr, uint64_t data, size_t size,
           if (vLpiIDBits > 0xf) {
               vLpiIDBits = 0xf;
           }
+          if (gic->getIts()) {
+              gic->getIts()->syncPendingVirtualLpis(this);
+          }
           break;
       }
 
       case GICR_VPENDBASER:
         vLpiPendingTablePtr = data & 0xFFFFFFFFF0000;
+        vLpiPendingTableValid = bits(data, 63);
+        residentVptAddr = vLpiPendingTableValid ? vLpiPendingTablePtr : 0;
+        residentVpeId = 0xffff;
+        DPRINTF(GIC, "GICR_VPENDBASER cpu=%u valid=%d vpt=%#llx resident_vpe=%u\n",
+                cpuId, vLpiPendingTableValid,
+                (unsigned long long)residentVptAddr, residentVpeId);
+        if (gic->getIts() && vLpiPendingTableValid) {
+            gic->getIts()->findVPEForRedistributor(this, residentVptAddr,
+                                                 residentVpeId);
+            gic->getIts()->syncPendingVirtualLpis(this);
+        }
         break;
 
       case GICR_INVLPIR: { // Redistributor Invalidate LPI Register
@@ -966,6 +987,11 @@ Gicv3Redistributor::setClrLPI(uint64_t data, bool set)
     uint8_t lpi_pending_entry_bit_position = lpi_id % 8;
     bool is_set = lpi_pending_entry & (1 << lpi_pending_entry_bit_position);
 
+    const bool clearResidentLr = !set && vLpiPendingTableValid &&
+        residentVpeId != 0xffff && residentVptAddr == vptAddr;
+    DPRINTF(GIC, "setClrVLPI cpu=%u vintid=%u set=%d vpt=%#llx resident_vpe=%u resident_vpt=%#llx clear_lr=%d\n",
+            cpuId, vintId, set, (unsigned long long)vptAddr, residentVpeId,
+            (unsigned long long)residentVptAddr, clearResidentLr);
     if (set) {
         if (is_set) {
             // Writes to GICR_SETLPIR have not effect if the pINTID field
@@ -990,6 +1016,123 @@ Gicv3Redistributor::setClrLPI(uint64_t data, bool set)
     writeEntryLPI(lpi_id, lpi_pending_entry);
 
     updateDistributor();
+}
+
+
+bool
+Gicv3Redistributor::isPendingVLPI(Addr vptAddr, uint32_t vintId)
+{
+    if (!vptAddr || vintId < SMALLEST_LPI_ID) {
+        return false;
+    }
+
+    const Addr pendingByteAddr = vptAddr + (vintId / 8);
+    const uint8_t pendingByte = memProxy->read<uint8_t>(pendingByteAddr);
+    return pendingByte & (1 << (vintId % 8));
+}
+
+void
+Gicv3Redistributor::setClrVLPI(Addr vptAddr, uint32_t vintId, bool set)
+{
+    if (!vptAddr || vintId < SMALLEST_LPI_ID) {
+        return;
+    }
+
+    const Addr pendingByteAddr = vptAddr + (vintId / 8);
+    uint8_t pendingByte = memProxy->read<uint8_t>(pendingByteAddr);
+    const uint8_t bitMask = 1 << (vintId % 8);
+
+    const bool clearResidentLr = !set && vLpiPendingTableValid &&
+        residentVpeId != 0xffff && residentVptAddr == vptAddr;
+    DPRINTF(GIC, "setClrVLPI cpu=%u vintid=%u set=%d vpt=%#llx resident_vpe=%u resident_vpt=%#llx clear_lr=%d\n",
+            cpuId, vintId, set, (unsigned long long)vptAddr, residentVpeId,
+            (unsigned long long)residentVptAddr, clearResidentLr);
+
+
+    if (set) {
+        pendingByte |= bitMask;
+    } else {
+        pendingByte &= ~bitMask;
+        if (clearResidentLr) {
+            cpuInterface->clearPendingVirtualLPI(vintId);
+        }
+    }
+
+    memProxy->writeBlob(pendingByteAddr, &pendingByte, sizeof(pendingByte));
+}
+
+bool
+Gicv3Redistributor::isVPEResident(uint16_t vpeId, Addr vptAddr) const
+{
+    return gic->params().gicv4 && !peInLowPowerState && vLpiPendingTableValid &&
+        residentVpeId == vpeId && residentVptAddr == vptAddr &&
+        vptAddr != 0;
+}
+
+bool
+Gicv3Redistributor::injectOrPendVLPI(uint16_t vpeId, uint32_t vintId,
+                                     Addr vptAddr, uint8_t vptIdBits,
+                                     uint32_t doorbellIntid,
+                                     Gicv3::GroupId group)
+{
+    (void)doorbellIntid;
+    if (vintId < SMALLEST_LPI_ID) {
+        return false;
+    }
+
+    const uint32_t largestVintId = 1u << (std::min<uint8_t>(vptIdBits, 0xf) + 1);
+    if (vintId >= largestVintId) {
+        return false;
+    }
+
+    setClrVLPI(vptAddr, vintId, true);
+    const bool resident = isVPEResident(vpeId, vptAddr);
+    DPRINTF(GIC, "injectOrPendVLPI cpu=%u vpe=%u vintid=%u resident=%d vpt=%#llx group=%d\n",
+            cpuId, vpeId, vintId, resident, (unsigned long long)vptAddr, group);
+
+    if (!resident) {
+        DPRINTF(GIC, "injectOrPendVLPI cpu=%u vintid=%u action=pend_nonresident\n",
+                cpuId, vintId);
+        return false;
+    }
+
+    uint8_t priority = 0xa0;
+    bool enabled = true;
+    if (vLpiConfigurationTablePtr) {
+        const LPIConfigurationTableEntry cfg =
+            memProxy->read<LPIConfigurationTableEntry>(
+                vLpiConfigurationTablePtr + vintId - SMALLEST_LPI_ID);
+        priority = static_cast<uint8_t>(cfg.priority << 2);
+        enabled = cfg.enable;
+    }
+
+    if (!enabled) {
+        DPRINTF(GIC, "injectOrPendVLPI cpu=%u vintid=%u action=disabled\n",
+                cpuId, vintId);
+        return false;
+    }
+
+    if (!cpuInterface->injectVirtualLPI(vintId, priority, group)) {
+        DPRINTF(GIC, "injectOrPendVLPI cpu=%u vintid=%u action=lr_unavailable\n",
+                cpuId, vintId);
+        return false;
+    }
+
+    DPRINTF(GIC, "injectOrPendVLPI cpu=%u vintid=%u action=delivered_clear_pending\n",
+            cpuId, vintId);
+    setClrVLPI(vptAddr, vintId, false);
+    return true;
+}
+
+void
+Gicv3Redistributor::syncPendingVLPI(uint16_t vpeId, Addr vptAddr, uint8_t vptIdBits)
+{
+    // Group-sensitive resident replay is handled by the ITS-side
+    // virtualIrq state. This fallback helper intentionally does not
+    // infer group from the pending table alone.
+    (void)vpeId;
+    (void)vptAddr;
+    (void)vptIdBits;
 }
 
 Gicv3::GroupId
@@ -1117,6 +1260,9 @@ Gicv3Redistributor::serialize(CheckpointOut & cp) const
     SERIALIZE_SCALAR(vLpiConfigurationTablePtr);
     SERIALIZE_SCALAR(vLpiIDBits);
     SERIALIZE_SCALAR(vLpiPendingTablePtr);
+    SERIALIZE_SCALAR(vLpiPendingTableValid);
+    SERIALIZE_SCALAR(residentVpeId);
+    SERIALIZE_SCALAR(residentVptAddr);
 }
 
 void
@@ -1142,6 +1288,8 @@ Gicv3Redistributor::unserialize(CheckpointIn & cp)
     UNSERIALIZE_SCALAR(vLpiConfigurationTablePtr);
     UNSERIALIZE_SCALAR(vLpiIDBits);
     UNSERIALIZE_SCALAR(vLpiPendingTablePtr);
+    UNSERIALIZE_SCALAR(vLpiPendingTableValid);
+    UNSERIALIZE_SCALAR(residentVpeId);
+    UNSERIALIZE_SCALAR(residentVptAddr);
 }
-
 } // namespace gem5

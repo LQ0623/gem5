@@ -40,6 +40,7 @@
 #include <cassert>
 #include <functional>
 
+#include "base/cprintf.hh"
 #include "base/logging.hh"
 #include "base/trace.hh"
 #include "debug/AddrRanges.hh"
@@ -60,6 +61,109 @@ namespace gem5
 const AddrRange Gicv3Its::GITS_BASER(0x0100, 0x0140);
 
 const uint32_t Gicv3Its::CTLR_QUIESCENT = 0x80000000;
+
+uint64_t
+Gicv3Its::virtualIrqKey(uint32_t deviceId, uint32_t eventId) const
+{
+    return (static_cast<uint64_t>(deviceId) << 32) | eventId;
+}
+
+Gicv3Its::VirtualPE *
+Gicv3Its::findVPE(uint16_t vpeId)
+{
+    auto it = virtualPes.find(vpeId);
+    return it == virtualPes.end() ? nullptr : &it->second;
+}
+
+const Gicv3Its::VirtualPE *
+Gicv3Its::findVPE(uint16_t vpeId) const
+{
+    auto it = virtualPes.find(vpeId);
+    return it == virtualPes.end() ? nullptr : &it->second;
+}
+
+Gicv3Its::VirtualIrqEntry *
+Gicv3Its::findVirtualIrq(uint32_t deviceId, uint32_t eventId)
+{
+    auto it = virtualIrqs.find(virtualIrqKey(deviceId, eventId));
+    return it == virtualIrqs.end() ? nullptr : &it->second;
+}
+
+const Gicv3Its::VirtualIrqEntry *
+Gicv3Its::findVirtualIrq(uint32_t deviceId, uint32_t eventId) const
+{
+    auto it = virtualIrqs.find(virtualIrqKey(deviceId, eventId));
+    return it == virtualIrqs.end() ? nullptr : &it->second;
+}
+
+void
+Gicv3Its::syncPendingVirtualLpis(Gicv3Redistributor *rd)
+{
+    if (!rd) {
+        return;
+    }
+
+    const uint16_t residentVpeId = rd->residentVPEID();
+    const Addr residentVptAddr = rd->residentVPTAddr();
+    DPRINTF(ITS, "syncPendingVirtualLpis cpu=%u resident_vpe=%u resident_vpt=%#llx\n",
+            rd->processorNumber(), residentVpeId,
+            (unsigned long long)residentVptAddr);
+    if (residentVpeId == 0xffff || residentVptAddr == 0) {
+        return;
+    }
+
+    const auto *vpe = findVPE(residentVpeId);
+    if (!vpe || !vpe->valid || vpe->vptAddr != residentVptAddr ||
+        getRedistributor(vpe->rdBase) != rd) {
+        return;
+    }
+
+    for (const auto &entry : virtualIrqs) {
+        const auto &virtualIrq = entry.second;
+        if (!virtualIrq.valid || virtualIrq.vpeid != residentVpeId) {
+            continue;
+        }
+
+        if (!rd->isPendingVLPI(vpe->vptAddr, virtualIrq.vintid)) {
+            continue;
+        }
+
+        DPRINTF(ITS, "syncPendingVirtualLpis replay cpu=%u vpe=%u vintid=%u group=%d\n",
+                rd->processorNumber(), residentVpeId, virtualIrq.vintid,
+                virtualIrq.group);
+        if (!rd->injectOrPendVLPI(residentVpeId, virtualIrq.vintid,
+                                  vpe->vptAddr, vpe->vptIdBits,
+                                  virtualIrq.doorbellIntid,
+                                  virtualIrq.group)) {
+            break;
+        }
+    }
+}
+
+bool
+Gicv3Its::findVPEForRedistributor(Gicv3Redistributor *rd, Addr vptAddr,
+                                 uint16_t &vpeId) const
+{
+    if (!rd || vptAddr == 0) {
+        return false;
+    }
+
+    for (const auto &entry : virtualPes) {
+        const auto &vpe = entry.second;
+        if (!vpe.valid || vpe.vptAddr != vptAddr) {
+            continue;
+        }
+
+        if (getRedistributor(vpe.rdBase) != rd) {
+            continue;
+        }
+
+        vpeId = entry.first;
+        return true;
+    }
+
+    return false;
+}
 
 ItsProcess::ItsProcess(Gicv3Its &_its)
   : its(_its), coroutine(nullptr)
@@ -248,49 +352,72 @@ ItsTranslation::main(Yield &yield)
 
     auto result = translateLPI(yield, device_id, event_id);
 
-    uint32_t intid = result.first;
-    Gicv3Redistributor *redist = result.second;
+    if (result.type == Gicv3Its::PHYSICAL_INTERRUPT) {
+        result.redistributor->setClrLPI(result.intid, true);
+    } else {
+        result.redistributor->injectOrPendVLPI(
+            result.vpeid, result.intid, result.vptAddr,
+            result.vptIdBits, result.doorbellIntid, result.group);
+    }
 
-    // Set the LPI in the redistributor
-    redist->setClrLPI(intid, true);
-
-    // Update the value in GITS_TRANSLATER only once we know
-    // there was no error in the tranlation process (before
-    // terminating the translation
     its.gitsTranslater = event_id;
-
     terminate(yield);
 }
 
-std::pair<uint32_t, Gicv3Redistributor *>
+Gicv3Its::TranslatedInt
 ItsTranslation::translateLPI(Yield &yield, uint32_t device_id,
                              uint32_t event_id)
 {
     if (its.deviceOutOfRange(device_id)) {
         terminate(yield);
     }
-
     DTE dte = readDeviceTable(yield, device_id);
-
     if (!dte.valid || its.idOutOfRange(event_id, dte.ittRange)) {
         terminate(yield);
     }
-
     ITTE itte = readIrqTranslationTable(yield, dte.ittAddress, event_id);
-    const auto collection_id = itte.icid;
-
-    if (!itte.valid || its.collectionOutOfRange(collection_id)) {
+    if (!itte.valid) {
         terminate(yield);
     }
 
-    CTE cte = readIrqCollectionTable(yield, collection_id);
+    DPRINTF(ITS, "translateLPI dev=%u event=%u type=%s vpe=%u intid=%u\n",
+        device_id, event_id,
+        itte.intType == Gicv3Its::VIRTUAL_INTERRUPT ? "virtual" : "physical",
+        itte.vpeid, itte.intNum);
 
+    if (itte.intType == Gicv3Its::VIRTUAL_INTERRUPT) {
+        const auto *virtualIrq = its.findVirtualIrq(device_id, event_id);
+        if (!virtualIrq || !virtualIrq->valid) {
+            terminate(yield);
+        }
+        const auto *vpe = its.findVPE(virtualIrq->vpeid);
+        if (!vpe || !vpe->valid) {
+            terminate(yield);
+        }
+        Gicv3Its::TranslatedInt result;
+        result.type = Gicv3Its::VIRTUAL_INTERRUPT;
+        result.intid = virtualIrq->vintid;
+        result.doorbellIntid = virtualIrq->doorbellIntid;
+        result.vpeid = virtualIrq->vpeid;
+        result.vptAddr = vpe->vptAddr;
+        result.vptIdBits = vpe->vptIdBits;
+        result.group = virtualIrq->group;
+        result.redistributor = its.getRedistributor(vpe->rdBase);
+        return result;
+    }
+    const auto collection_id = itte.icid;
+    if (its.collectionOutOfRange(collection_id)) {
+        terminate(yield);
+    }
+    CTE cte = readIrqCollectionTable(yield, collection_id);
     if (!cte.valid) {
         terminate(yield);
     }
-
-    // Returning the INTID and the target Redistributor
-    return std::make_pair(itte.intNum, its.getRedistributor(cte));
+    Gicv3Its::TranslatedInt result;
+    result.type = Gicv3Its::PHYSICAL_INTERRUPT;
+    result.intid = itte.intNum;
+    result.redistributor = its.getRedistributor(cte);
+    return result;
 }
 
 ItsCommand::DispatchTable ItsCommand::cmdDispatcher =
@@ -400,29 +527,38 @@ ItsCommand::clear(Yield &yield, CommandEntry &command)
     }
 
     DTE dte = readDeviceTable(yield, command.deviceId);
-
     if (!dte.valid || idOutOfRange(command, dte)) {
         its.incrementReadPointer();
         terminate(yield);
     }
 
-    ITTE itte = readIrqTranslationTable(
-        yield, dte.ittAddress, command.eventId);
-
+    ITTE itte = readIrqTranslationTable(yield, dte.ittAddress, command.eventId);
     if (!itte.valid) {
         its.incrementReadPointer();
         terminate(yield);
     }
 
+    if (itte.intType == Gicv3Its::VIRTUAL_INTERRUPT) {
+        const auto *virtualIrq = its.findVirtualIrq(command.deviceId, command.eventId);
+        const auto *vpe = virtualIrq ? its.findVPE(virtualIrq->vpeid) : nullptr;
+        if (!virtualIrq || !virtualIrq->valid || !vpe || !vpe->valid) {
+            its.incrementReadPointer();
+            terminate(yield);
+        }
+
+        its.getRedistributor(vpe->rdBase)->setClrVLPI(vpe->vptAddr,
+                                                      virtualIrq->vintid,
+                                                      false);
+        return;
+    }
+
     const auto collection_id = itte.icid;
     CTE cte = readIrqCollectionTable(yield, collection_id);
-
     if (!cte.valid) {
         its.incrementReadPointer();
         terminate(yield);
     }
 
-    // Clear the LPI in the redistributor
     its.getRedistributor(cte)->setClrLPI(itte.intNum, false);
 }
 
@@ -435,34 +571,38 @@ ItsCommand::discard(Yield &yield, CommandEntry &command)
     }
 
     DTE dte = readDeviceTable(yield, command.deviceId);
-
     if (!dte.valid || idOutOfRange(command, dte)) {
         its.incrementReadPointer();
         terminate(yield);
     }
 
-    ITTE itte = readIrqTranslationTable(
-        yield, dte.ittAddress, command.eventId);
-
+    ITTE itte = readIrqTranslationTable(yield, dte.ittAddress, command.eventId);
     if (!itte.valid) {
         its.incrementReadPointer();
         terminate(yield);
     }
 
-    const auto collection_id = itte.icid;
-    Gicv3Its::CTE cte = readIrqCollectionTable(yield, collection_id);
-
-    if (!cte.valid) {
-        its.incrementReadPointer();
-        terminate(yield);
+    if (itte.intType == Gicv3Its::VIRTUAL_INTERRUPT) {
+        const auto *virtualIrq = its.findVirtualIrq(command.deviceId, command.eventId);
+        const auto *vpe = virtualIrq ? its.findVPE(virtualIrq->vpeid) : nullptr;
+        if (virtualIrq && virtualIrq->valid && vpe && vpe->valid) {
+            its.getRedistributor(vpe->rdBase)->setClrVLPI(vpe->vptAddr,
+                                                          virtualIrq->vintid,
+                                                          false);
+        }
+        its.virtualIrqs.erase(its.virtualIrqKey(command.deviceId, command.eventId));
+    } else {
+        const auto collection_id = itte.icid;
+        Gicv3Its::CTE cte = readIrqCollectionTable(yield, collection_id);
+        if (!cte.valid) {
+            its.incrementReadPointer();
+            terminate(yield);
+        }
+        its.getRedistributor(cte)->setClrLPI(itte.intNum, false);
     }
 
-    its.getRedistributor(cte)->setClrLPI(itte.intNum, false);
-
-    // Then removes the mapping from the ITT (invalidating)
     itte.valid = 0;
-    writeIrqTranslationTable(
-        yield, dte.ittAddress, command.eventId, itte);
+    writeIrqTranslationTable(yield, dte.ittAddress, command.eventId, itte);
 }
 
 void
@@ -474,29 +614,38 @@ ItsCommand::doInt(Yield &yield, CommandEntry &command)
     }
 
     DTE dte = readDeviceTable(yield, command.deviceId);
-
     if (!dte.valid || idOutOfRange(command, dte)) {
         its.incrementReadPointer();
         terminate(yield);
     }
 
-    ITTE itte = readIrqTranslationTable(
-        yield, dte.ittAddress, command.eventId);
-
+    ITTE itte = readIrqTranslationTable(yield, dte.ittAddress, command.eventId);
     if (!itte.valid) {
         its.incrementReadPointer();
         terminate(yield);
     }
 
+    if (itte.intType == Gicv3Its::VIRTUAL_INTERRUPT) {
+        const auto *virtualIrq = its.findVirtualIrq(command.deviceId, command.eventId);
+        const auto *vpe = virtualIrq ? its.findVPE(virtualIrq->vpeid) : nullptr;
+        if (!virtualIrq || !virtualIrq->valid || !vpe || !vpe->valid) {
+            its.incrementReadPointer();
+            terminate(yield);
+        }
+
+        its.getRedistributor(vpe->rdBase)->injectOrPendVLPI(
+            virtualIrq->vpeid, virtualIrq->vintid, vpe->vptAddr,
+            vpe->vptIdBits, virtualIrq->doorbellIntid, virtualIrq->group);
+        return;
+    }
+
     const auto collection_id = itte.icid;
     CTE cte = readIrqCollectionTable(yield, collection_id);
-
     if (!cte.valid) {
         its.incrementReadPointer();
         terminate(yield);
     }
 
-    // Set the LPI in the redistributor
     its.getRedistributor(cte)->setClrLPI(itte.intNum, true);
 }
 
@@ -735,49 +884,163 @@ ItsCommand::movi(Yield &yield, CommandEntry &command)
 void
 ItsCommand::sync(Yield &yield, CommandEntry &command)
 {
-    warn("ITS %s command unimplemented", __func__);
+    // No ITS-side caches are modelled in this minimal implementation.
 }
 
 void
 ItsCommand::vinvall(Yield &yield, CommandEntry &command)
 {
-    panic("ITS %s command unimplemented", __func__);
+    // No virtual LPI cache is modelled yet, so this is a legal no-op.
 }
 
 void
 ItsCommand::vmapi(Yield &yield, CommandEntry &command)
 {
-    panic("ITS %s command unimplemented", __func__);
+    if (deviceOutOfRange(command)) {
+        its.incrementReadPointer();
+        terminate(yield);
+    }
+
+    DTE dte = readDeviceTable(yield, command.deviceId);
+    const uint16_t vpeId = bits(command.raw[2], 15, 0);
+    const auto *vpe = its.findVPE(vpeId);
+    if (!dte.valid || idOutOfRange(command, dte) || !vpe || !vpe->valid) {
+        its.incrementReadPointer();
+        terminate(yield);
+    }
+
+    ITTE itte = readIrqTranslationTable(yield, dte.ittAddress, command.eventId);
+    const uint32_t doorbellIntid = bits(command.raw[1], 63, 32);
+    itte.valid = 1;
+    itte.intType = Gicv3Its::VIRTUAL_INTERRUPT;
+    itte.vpeid = vpeId;
+    itte.intNum = command.eventId & 0x3fff;
+    itte.intNumHyp = doorbellIntid & 0x3fff;
+    writeIrqTranslationTable(yield, dte.ittAddress, command.eventId, itte);
+
+    Gicv3Its::VirtualIrqEntry virt;
+    virt.valid = true;
+    // Minimal implementation: virtual LPIs are currently modelled as Group1NS only.
+    virt.group = Gicv3::G1NS;
+    virt.vintid = command.eventId;
+    virt.doorbellIntid = doorbellIntid;
+    virt.vpeid = vpeId;
+    its.virtualIrqs[its.virtualIrqKey(command.deviceId, command.eventId)] = virt;
 }
 
 void
 ItsCommand::vmapp(Yield &yield, CommandEntry &command)
 {
-    panic("ITS %s command unimplemented", __func__);
+    const uint16_t vpeId = bits(command.raw[1], 15, 0);
+    Gicv3Its::VirtualPE &vpe = its.virtualPes[vpeId];
+    vpe.valid = bits(command.raw[2], 63);
+    vpe.vptIdBits = bits(command.raw[2], 59, 53);
+    vpe.vptAddr = command.raw[2] & 0xFFFFFFFFF0000ULL;
+    vpe.rdBase = bits(command.raw[3], 50, 16);
+    vpe.doorbellIntid = bits(command.raw[3], 31, 0);
+
+    if (vpe.valid) {
+        its.syncPendingVirtualLpis(its.getRedistributor(vpe.rdBase));
+    }
 }
 
 void
 ItsCommand::vmapti(Yield &yield, CommandEntry &command)
 {
-    panic("ITS %s command unimplemented", __func__);
+    if (deviceOutOfRange(command)) {
+        its.incrementReadPointer();
+        terminate(yield);
+    }
+
+    DTE dte = readDeviceTable(yield, command.deviceId);
+    const uint16_t vpeId = bits(command.raw[2], 15, 0);
+    const auto *vpe = its.findVPE(vpeId);
+    const uint32_t vintid = bits(command.raw[1], 63, 32);
+    if (!dte.valid || idOutOfRange(command, dte) || !vpe || !vpe->valid) {
+        its.incrementReadPointer();
+        terminate(yield);
+    }
+
+    ITTE itte = readIrqTranslationTable(yield, dte.ittAddress, command.eventId);
+    itte.valid = 1;
+    itte.intType = Gicv3Its::VIRTUAL_INTERRUPT;
+    itte.vpeid = vpeId;
+    itte.intNum = vintid & 0x3fff;
+    itte.intNumHyp = bits(command.raw[3], 13, 0);
+    writeIrqTranslationTable(yield, dte.ittAddress, command.eventId, itte);
+
+    Gicv3Its::VirtualIrqEntry virt;
+    virt.valid = true;
+    // Minimal implementation: virtual LPIs are currently modelled as Group1NS only.
+    virt.group = Gicv3::G1NS;
+    virt.vintid = vintid;
+    virt.doorbellIntid = bits(command.raw[3], 31, 0);
+    virt.vpeid = vpeId;
+    its.virtualIrqs[its.virtualIrqKey(command.deviceId, command.eventId)] = virt;
 }
 
 void
 ItsCommand::vmovi(Yield &yield, CommandEntry &command)
 {
-    panic("ITS %s command unimplemented", __func__);
+    if (deviceOutOfRange(command)) {
+        its.incrementReadPointer();
+        terminate(yield);
+    }
+
+    DTE dte = readDeviceTable(yield, command.deviceId);
+    if (!dte.valid || idOutOfRange(command, dte)) {
+        its.incrementReadPointer();
+        terminate(yield);
+    }
+
+    ITTE itte = readIrqTranslationTable(yield, dte.ittAddress, command.eventId);
+    if (!itte.valid || itte.intType != Gicv3Its::VIRTUAL_INTERRUPT) {
+        its.incrementReadPointer();
+        terminate(yield);
+    }
+
+    auto *virt = its.findVirtualIrq(command.deviceId, command.eventId);
+    const uint16_t newVpeId = bits(command.raw[2], 15, 0);
+    const auto *oldVpe = virt ? its.findVPE(virt->vpeid) : nullptr;
+    const auto *newVpe = its.findVPE(newVpeId);
+    if (!virt || !virt->valid || !newVpe || !newVpe->valid) {
+        its.incrementReadPointer();
+        terminate(yield);
+    }
+
+    if (oldVpe && oldVpe->valid && oldVpe->vptAddr != newVpe->vptAddr) {
+        auto *redist = its.getRedistributor(oldVpe->rdBase);
+        if (redist->isPendingVLPI(oldVpe->vptAddr, virt->vintid)) {
+            redist->setClrVLPI(oldVpe->vptAddr, virt->vintid, false);
+            its.getRedistributor(newVpe->rdBase)->setClrVLPI(newVpe->vptAddr,
+                                                             virt->vintid,
+                                                             true);
+        }
+    }
+
+    virt->vpeid = newVpeId;
+    itte.vpeid = newVpeId;
+    writeIrqTranslationTable(yield, dte.ittAddress, command.eventId, itte);
+    its.syncPendingVirtualLpis(its.getRedistributor(newVpe->rdBase));
 }
 
 void
 ItsCommand::vmovp(Yield &yield, CommandEntry &command)
 {
-    panic("ITS %s command unimplemented", __func__);
+    const uint16_t vpeId = bits(command.raw[1], 15, 0);
+    auto *vpe = its.findVPE(vpeId);
+    if (!vpe || !vpe->valid) {
+        return;
+    }
+
+    vpe->rdBase = bits(command.raw[2], 50, 16);
+    its.syncPendingVirtualLpis(its.getRedistributor(vpe->rdBase));
 }
 
 void
 ItsCommand::vsync(Yield &yield, CommandEntry &command)
 {
-    panic("ITS %s command unimplemented", __func__);
+    // No asynchronous virtual-cache maintenance is modelled yet.
 }
 
 Gicv3Its::Gicv3Its(const Gicv3ItsParams &params)
@@ -810,6 +1073,10 @@ Gicv3Its::setGIC(Gicv3 *_gic)
 {
     assert(!gic);
     gic = _gic;
+    if (gic->params().gicv4) {
+        gitsTyper._virtual = 1;
+        gitsTyper.vmovp = 1;
+    }
 }
 
 AddrRangeList
@@ -1048,10 +1315,32 @@ Gicv3Its::serialize(CheckpointOut & cp) const
     SERIALIZE_SCALAR(gitsCreadr);
     SERIALIZE_SCALAR(gitsCwriter);
     SERIALIZE_SCALAR(gitsIidr);
-
     SERIALIZE_CONTAINER(tableBases);
+    const uint32_t numVirtualPes = virtualPes.size();
+    SERIALIZE_SCALAR(numVirtualPes);
+    uint32_t virtualPeIndex = 0;
+    for (const auto &entry : virtualPes) {
+        paramOut(cp, csprintf("virtualPes_%u_vpeid", virtualPeIndex), entry.first);
+        paramOut(cp, csprintf("virtualPes_%u_valid", virtualPeIndex), entry.second.valid);
+        paramOut(cp, csprintf("virtualPes_%u_rdBase", virtualPeIndex), entry.second.rdBase);
+        paramOut(cp, csprintf("virtualPes_%u_vptAddr", virtualPeIndex), entry.second.vptAddr);
+        paramOut(cp, csprintf("virtualPes_%u_vptIdBits", virtualPeIndex), entry.second.vptIdBits);
+        paramOut(cp, csprintf("virtualPes_%u_doorbellIntid", virtualPeIndex), entry.second.doorbellIntid);
+        virtualPeIndex++;
+    }
+    const uint32_t numVirtualIrqs = virtualIrqs.size();
+    SERIALIZE_SCALAR(numVirtualIrqs);
+    uint32_t virtualIrqIndex = 0;
+    for (const auto &entry : virtualIrqs) {
+        paramOut(cp, csprintf("virtualIrqs_%u_key", virtualIrqIndex), entry.first);
+        paramOut(cp, csprintf("virtualIrqs_%u_valid", virtualIrqIndex), entry.second.valid);
+        paramOut(cp, csprintf("virtualIrqs_%u_vintid", virtualIrqIndex), entry.second.vintid);
+        paramOut(cp, csprintf("virtualIrqs_%u_doorbellIntid", virtualIrqIndex), entry.second.doorbellIntid);
+        paramOut(cp, csprintf("virtualIrqs_%u_vpeid", virtualIrqIndex), entry.second.vpeid);
+        paramOut(cp, csprintf("virtualIrqs_%u_group", virtualIrqIndex), entry.second.group);
+        virtualIrqIndex++;
+    }
 }
-
 void
 Gicv3Its::unserialize(CheckpointIn & cp)
 {
@@ -1061,8 +1350,35 @@ Gicv3Its::unserialize(CheckpointIn & cp)
     UNSERIALIZE_SCALAR(gitsCreadr);
     UNSERIALIZE_SCALAR(gitsCwriter);
     UNSERIALIZE_SCALAR(gitsIidr);
-
     UNSERIALIZE_CONTAINER(tableBases);
+    virtualPes.clear();
+    uint32_t numVirtualPes;
+    UNSERIALIZE_SCALAR(numVirtualPes);
+    for (uint32_t i = 0; i < numVirtualPes; ++i) {
+        uint16_t vpeid;
+        VirtualPE vpe;
+        paramIn(cp, csprintf("virtualPes_%u_vpeid", i), vpeid);
+        paramIn(cp, csprintf("virtualPes_%u_valid", i), vpe.valid);
+        paramIn(cp, csprintf("virtualPes_%u_rdBase", i), vpe.rdBase);
+        paramIn(cp, csprintf("virtualPes_%u_vptAddr", i), vpe.vptAddr);
+        paramIn(cp, csprintf("virtualPes_%u_vptIdBits", i), vpe.vptIdBits);
+        paramIn(cp, csprintf("virtualPes_%u_doorbellIntid", i), vpe.doorbellIntid);
+        virtualPes[vpeid] = vpe;
+    }
+    virtualIrqs.clear();
+    uint32_t numVirtualIrqs;
+    UNSERIALIZE_SCALAR(numVirtualIrqs);
+    for (uint32_t i = 0; i < numVirtualIrqs; ++i) {
+        uint64_t key;
+        VirtualIrqEntry irq;
+        paramIn(cp, csprintf("virtualIrqs_%u_key", i), key);
+        paramIn(cp, csprintf("virtualIrqs_%u_valid", i), irq.valid);
+        paramIn(cp, csprintf("virtualIrqs_%u_vintid", i), irq.vintid);
+        paramIn(cp, csprintf("virtualIrqs_%u_doorbellIntid", i), irq.doorbellIntid);
+        paramIn(cp, csprintf("virtualIrqs_%u_vpeid", i), irq.vpeid);
+        paramIn(cp, csprintf("virtualIrqs_%u_group", i), irq.group);
+        virtualIrqs[key] = irq;
+    }
 }
 
 void

@@ -41,6 +41,7 @@
 #include <cstdint>
 #include <memory>
 #include <queue>
+#include <unordered_map>
 #include <vector>
 
 #include "base/addr_range.hh"
@@ -48,6 +49,7 @@
 #include "base/coroutine.hh"
 #include "base/types.hh"
 #include "dev/dma_device.hh"
+#include "dev/arm/gic_v3.hh"
 
 namespace gem5
 {
@@ -297,6 +299,36 @@ class Gicv3Its : public BasicPioDevice
         PHYSICAL_INTERRUPT = 1
     };
 
+    struct VirtualPE
+    {
+        bool valid = false;
+        uint64_t rdBase = 0;
+        Addr vptAddr = 0;
+        uint8_t vptIdBits = 0;
+        uint32_t doorbellIntid = Gicv3::INTID_SPURIOUS;
+    };
+
+    struct VirtualIrqEntry
+    {
+        bool valid = false;
+        uint32_t vintid = 0;
+        uint32_t doorbellIntid = Gicv3::INTID_SPURIOUS;
+        uint16_t vpeid = 0;
+        Gicv3::GroupId group = Gicv3::G1NS;
+    };
+
+    struct TranslatedInt
+    {
+        InterruptType type = PHYSICAL_INTERRUPT;
+        uint32_t intid = 0;
+        uint32_t doorbellIntid = Gicv3::INTID_SPURIOUS;
+        uint16_t vpeid = 0;
+        Addr vptAddr = 0;
+        uint8_t vptIdBits = 0;
+        Gicv3::GroupId group = Gicv3::G1NS;
+        Gicv3Redistributor *redistributor = nullptr;
+    };
+
   private:
     Gicv3Redistributor* getRedistributor(uint64_t rd_base);
     Gicv3Redistributor* getRedistributor(CTE cte)
@@ -327,6 +359,17 @@ class Gicv3Its : public BasicPioDevice
 
     void moveAllPendingState(
         Gicv3Redistributor *rd1, Gicv3Redistributor *rd2);
+    uint64_t virtualIrqKey(uint32_t deviceId, uint32_t eventId) const;
+    VirtualPE *findVPE(uint16_t vpeId);
+    const VirtualPE *findVPE(uint16_t vpeId) const;
+    VirtualIrqEntry *findVirtualIrq(uint32_t deviceId, uint32_t eventId);
+    const VirtualIrqEntry *findVirtualIrq(uint32_t deviceId,
+                                          uint32_t eventId) const;
+
+  public:
+    void syncPendingVirtualLpis(Gicv3Redistributor *rd);
+    bool findVPEForRedistributor(Gicv3Redistributor *rd, Addr vptAddr,
+                                uint16_t &vpeId) const;
 
   private:
     std::queue<ItsAction> packetsToRetry;
@@ -336,6 +379,8 @@ class Gicv3Its : public BasicPioDevice
 
     bool pendingCommands;
     uint32_t pendingTranslations;
+    std::unordered_map<uint16_t, VirtualPE> virtualPes;
+    std::unordered_map<uint64_t, VirtualIrqEntry> virtualIrqs;
 };
 
 /**
@@ -416,7 +461,7 @@ class ItsTranslation : public ItsProcess
   protected:
     void main(Yield &yield) override;
 
-    std::pair<uint32_t, Gicv3Redistributor *>
+    Gicv3Its::TranslatedInt
     translateLPI(Yield &yield, uint32_t device_id, uint32_t event_id);
 };
 

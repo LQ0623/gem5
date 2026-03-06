@@ -199,6 +199,12 @@ class Gicv3 : public BaseGic, public Gicv3Registers
         return distributor;
     }
 
+    inline Gicv3Its *
+    getIts() const
+    {
+        return its;
+    }
+
     inline Gicv3Redistributor *
     getRedistributor(ContextID context_id) const
     {

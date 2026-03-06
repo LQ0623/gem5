@@ -93,7 +93,7 @@ Gicv3Distributor::Gicv3Distributor(Gicv3 * gic, uint32_t it_lines)
       gicdPidr4(0x44),
       enable1ofNRR(gic->params().enable_1ofn_rr),
       enable1ofNBusyAware(gic->params().enable_1ofn_busy),
-      rrCursor1ofN(-1), // <--- 初始化为 -1
+      rrCursor1ofN(-1), // <--- 鍒濆鍖栦负 -1
       lastRoutedCpu(it_lines, -1),
       Log_observation(gic->params().log_observation),
       setspiWrites(0),
@@ -112,9 +112,9 @@ Gicv3Distributor::Gicv3Distributor(Gicv3 * gic, uint32_t it_lines)
      * (Supports nonzero values of Affinity level 3)
      * IDbits        [23:19] == 0xf
      * (The number of interrupt identifier bits supported, minus one)
-     * DVIS          [18]    == 0
-     * (The implementation does not support Direct Virtual LPI
-     * injection)
+     * DVIS          [18]    == X
+     * (Direct Virtual LPI injection is supported when GICv4 support
+     * is enabled for this model)
      * LPIS          [17]    == 1
      * (The implementation does not support LPIs)
      * MBIS          [16]    == 1
@@ -130,8 +130,9 @@ Gicv3Distributor::Gicv3Distributor(Gicv3 * gic, uint32_t it_lines)
     bool have_security = gic->getSystem()->has(ArmExtension::SECURITY);
     int max_spi_int_id = itLines - 1;
     int it_lines_number = divCeil(max_spi_int_id + 1, 32) - 1;
+    const uint32_t dvis = gic->params().gicv4 ? 1 : 0;
     gicdTyper = (1 << 26) | (0 << 25) | (1 << 24) | (IDBITS << 19) |
-        (1 << 17) | (1 << 16) |
+        (dvis << 18) | (1 << 17) | (1 << 16) |
         ((have_security ? 1 : 0) << 10) |
         (it_lines_number << 0);
 
@@ -969,7 +970,7 @@ Gicv3Distributor::write(Addr addr, uint64_t data, size_t size,
         // corresponding GICD_NSACR<n> register is 0.
         const uint32_t intid = bits(data, 12, 0);
 
-        // --- 采样修改前状态 ---
+        // --- 閲囨牱淇敼鍓嶇姸鎬?---
         const bool beforePending  = (intid < irqPending.size()) ? irqPending[intid] : false;
         const bool beforeIspendr  = (intid < irqPendingIspendr.size()) ? irqPendingIspendr[intid] : false;
         const bool beforeEnabled  = (intid < irqEnabled.size()) ? irqEnabled[intid] : false;
@@ -985,7 +986,7 @@ Gicv3Distributor::write(Addr addr, uint64_t data, size_t size,
         if (isNotSPI(intid) || irqPending[intid] ||
             (nsAccessToSecInt(intid, is_secure_access) &&
              irqNsacr[intid] == 0)) {
-            // --- 打印 WI 原因 ---
+            // --- 鎵撳嵃 WI 鍘熷洜 ---
             DPRINTF(GIC,
                 "GICD_SETSPI_SR WI intid=%u reason: DS=%d isNotSPI=%d alreadyPend=%d is_sec=%d\n",
                 intid, DS, isNotSPI(intid), (intid < irqPending.size()) ? irqPending[intid] : -1,
@@ -995,7 +996,7 @@ Gicv3Distributor::write(Addr addr, uint64_t data, size_t size,
             // Valid SPI, set interrupt pending
             sendInt(intid);
 
-            // --- 采样修改后状态 ---
+            // --- 閲囨牱淇敼鍚庣姸鎬?---
             const bool afterPending = (intid < irqPending.size()) ? irqPending[intid] : false;
             const bool afterIspendr = (intid < irqPendingIspendr.size()) ? irqPendingIspendr[intid] : false;
             DPRINTF(GIC,
@@ -1014,7 +1015,7 @@ Gicv3Distributor::write(Addr addr, uint64_t data, size_t size,
         // corresponding GICD_NSACR<n> register is less than 0b10.
         const uint32_t intid = bits(data, 12, 0);
 
-        // --- 采样修改前状态 ---
+        // --- 閲囨牱淇敼鍓嶇姸鎬?---
         const bool beforePending  = (intid < irqPending.size()) ? irqPending[intid] : false;
         const bool beforeIspendr  = (intid < irqPendingIspendr.size()) ? irqPendingIspendr[intid] : false;
         const bool beforeEnabled  = (intid < irqEnabled.size()) ? irqEnabled[intid] : false;
@@ -1030,7 +1031,7 @@ Gicv3Distributor::write(Addr addr, uint64_t data, size_t size,
         if (isNotSPI(intid) || !irqPending[intid] ||
             (nsAccessToSecInt(intid, is_secure_access) &&
              irqNsacr[intid] < 2)) {
-            // --- 打印 WI 原因 ---
+            // --- 鎵撳嵃 WI 鍘熷洜 ---
             DPRINTF(GIC,
                 "GICD_CLRSPI_SR WI intid=%u reason: DS=%d isNotSPI=%d notPend=%d is_sec=%d\n",
                 intid, DS, isNotSPI(intid), (intid < irqPending.size()) ? !irqPending[intid] : -1,
@@ -1040,7 +1041,7 @@ Gicv3Distributor::write(Addr addr, uint64_t data, size_t size,
             // Valid SPI, clear interrupt pending
             deassertSPI(intid);
 
-            // --- 采样修改后状态 ---
+            // --- 閲囨牱淇敼鍚庣姸鎬?---
             const bool afterPending = (intid < irqPending.size()) ? irqPending[intid] : false;
             const bool afterIspendr = (intid < irqPendingIspendr.size()) ? irqPendingIspendr[intid] : false;
             DPRINTF(GIC,
@@ -1101,7 +1102,7 @@ Gicv3Distributor::sendInt(uint32_t int_id)
     update();
 
     setspiWrites++;
-    // 到不了结尾就说明这个中断写入是错误的
+    // 鍒颁笉浜嗙粨灏惧氨璇存槑杩欎釜涓柇鍐欏叆鏄敊璇殑
     badIntidWrites--;
 }
 
@@ -1259,7 +1260,7 @@ Gicv3Distributor::clearIrqCpuInterface(uint32_t int_id)
         auto *ci = gic->getRedistributor(idx)->getCPUInterface();
         if (ci) ci->resetHppi(int_id);
     } else {
-        // fallback：如果从未路由过，再 route 一次（很少发生）
+        // fallback锛氬鏋滀粠鏈矾鐢辫繃锛屽啀 route 涓€娆★紙寰堝皯鍙戠敓锛?
         auto *ci = route(int_id);
         if (ci) ci->resetHppi(int_id);
     }
@@ -1306,9 +1307,9 @@ Gicv3Distributor::update()
         }
     }
 
-    // 在你“确认某个 intid 被选为最高优先级”那一刻打印：
+    // 鍦ㄤ綘鈥滅‘璁ゆ煇涓?intid 琚€変负鏈€楂樹紭鍏堢骇鈥濋偅涓€鍒绘墦鍗帮細
     DPRINTF(GIC, "DIST select intid=%u prio=%u group=%u targetCpu=%d\n",
-            target_id, irqPriority[target_id], target_group, lastRoutedCpu[target_id]); // 若没有 lastRoutedCpu，就打印 route() 得到的 idx
+            target_id, irqPriority[target_id], target_group, lastRoutedCpu[target_id]); // 鑻ユ病鏈?lastRoutedCpu锛屽氨鎵撳嵃 route() 寰楀埌鐨?idx
 
     DPRINTF(GIC, "DIST update() end\n");
 
@@ -1420,7 +1421,7 @@ Gicv3Distributor::serialize(CheckpointOut & cp) const
     SERIALIZE_CONTAINER(irqGrpmod);
     SERIALIZE_CONTAINER(irqNsacr);
     SERIALIZE_CONTAINER(irqAffinityRouting);
-    SERIALIZE_SCALAR(rrCursor1ofN); // <--- 保存状态
+    SERIALIZE_SCALAR(rrCursor1ofN); // <--- 淇濆瓨鐘舵€?
 }
 
 void
@@ -1441,7 +1442,7 @@ Gicv3Distributor::unserialize(CheckpointIn & cp)
     UNSERIALIZE_CONTAINER(irqGrpmod);
     UNSERIALIZE_CONTAINER(irqNsacr);
     UNSERIALIZE_CONTAINER(irqAffinityRouting);
-    UNSERIALIZE_SCALAR(rrCursor1ofN); // <--- 恢复状态
+    UNSERIALIZE_SCALAR(rrCursor1ofN); // <--- 鎭㈠鐘舵€?
 }
 
 } // namespace gem5

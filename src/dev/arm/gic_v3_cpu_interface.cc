@@ -46,6 +46,7 @@
 #include "dev/arm/gic_v3.hh"
 #include "dev/arm/gic_v3_distributor.hh"
 #include "dev/arm/gic_v3_redistributor.hh"
+#include "dev/arm/gic_v3_its.hh"
 
 namespace gem5
 {
@@ -82,6 +83,96 @@ Gicv3CPUInterface::resetHppi(uint32_t intid)
 {
     if (intid == hppi.intid)
         hppi.prio = 0xff;
+}
+
+bool
+Gicv3CPUInterface::injectVirtualLPI(uint32_t intid, uint8_t priority,
+                                    Gicv3::GroupId group)
+{
+    const uint8_t encodedPrio = priority & 0xf8;
+    int freeIdx = -1;
+
+    for (int lrIdx = 0; lrIdx < VIRTUAL_NUM_LIST_REGS; lrIdx++) {
+        ICH_LR_EL2 ich_lr_el2 =
+            isa->readMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lrIdx);
+
+        if (ich_lr_el2.State == ICH_LR_EL2_STATE_INVALID) {
+            if (freeIdx < 0) {
+                freeIdx = lrIdx;
+            }
+            continue;
+        }
+
+        if (ich_lr_el2.vINTID == intid) {
+            if (ich_lr_el2.State == ICH_LR_EL2_STATE_ACTIVE) {
+                ich_lr_el2.State = ICH_LR_EL2_STATE_ACTIVE_PENDING;
+                ich_lr_el2.Priority = encodedPrio;
+                ich_lr_el2.Group = group == Gicv3::G1NS ? 1 : 0;
+                isa->setMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lrIdx, ich_lr_el2);
+                virtualUpdate();
+                DPRINTF(GIC, "injectVirtualLPI cpu=%u intid=%u lr=%d action=upgrade_active_pending\n",
+                        cpuId, intid, lrIdx);
+            } else {
+                DPRINTF(GIC, "injectVirtualLPI cpu=%u intid=%u lr=%d action=already_carried state=%u\n",
+                        cpuId, intid, lrIdx, ich_lr_el2.State);
+            }
+            // Returning success is only valid if the LR already carries the
+            // new arrival's pending state, or we just upgraded ACTIVE to
+            // ACTIVE_PENDING above.
+            return true;
+        }
+    }
+
+    if (freeIdx < 0) {
+        DPRINTF(GIC, "injectVirtualLPI cpu=%u intid=%u action=lr_full\n",
+                cpuId, intid);
+        return false;
+    }
+
+    ICH_LR_EL2 ich_lr_el2 = 0;
+    ich_lr_el2.State = ICH_LR_EL2_STATE_PENDING;
+    ich_lr_el2.HW = 0;
+    ich_lr_el2.Group = group == Gicv3::G1NS ? 1 : 0;
+    ich_lr_el2.Priority = encodedPrio;
+    ich_lr_el2.EOI = 0;
+    ich_lr_el2.vINTID = intid;
+    isa->setMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + freeIdx, ich_lr_el2);
+    DPRINTF(GIC, "injectVirtualLPI cpu=%u intid=%u lr=%d action=allocate_new\n",
+            cpuId, intid, freeIdx);
+    virtualUpdate();
+    return true;
+}
+
+bool
+Gicv3CPUInterface::clearPendingVirtualLPI(uint32_t intid)
+{
+    bool cleared = false;
+
+    for (int lrIdx = 0; lrIdx < VIRTUAL_NUM_LIST_REGS; lrIdx++) {
+        ICH_LR_EL2 ich_lr_el2 =
+            isa->readMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lrIdx);
+
+        if (ich_lr_el2.State == ICH_LR_EL2_STATE_INVALID ||
+            ich_lr_el2.vINTID != intid) {
+            continue;
+        }
+
+        if (ich_lr_el2.State == ICH_LR_EL2_STATE_PENDING) {
+            ich_lr_el2.State = ICH_LR_EL2_STATE_INVALID;
+            isa->setMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lrIdx, ich_lr_el2);
+            cleared = true;
+        } else if (ich_lr_el2.State == ICH_LR_EL2_STATE_ACTIVE_PENDING) {
+            ich_lr_el2.State = ICH_LR_EL2_STATE_ACTIVE;
+            isa->setMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lrIdx, ich_lr_el2);
+            cleared = true;
+        }
+    }
+
+    if (cleared) {
+        virtualUpdate();
+    }
+
+    return cleared;
 }
 
 void
@@ -1927,9 +2018,13 @@ Gicv3CPUInterface::virtualDeactivateIRQ(int lr_idx)
         }
     }
 
-    //  Remove the active bit
+        //  Remove the active bit
     ich_lr_el2.State = ich_lr_el2.State & ~ICH_LR_EL2_STATE_ACTIVE;
     isa->setMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx, ich_lr_el2);
+
+    if (gic->getIts()) {
+        gic->getIts()->syncPendingVirtualLpis(redistributor);
+    }
 }
 
 /*

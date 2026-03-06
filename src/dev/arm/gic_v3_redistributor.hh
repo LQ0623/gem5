@@ -189,6 +189,9 @@ class Gicv3Redistributor : public Serializable
     Addr vLpiConfigurationTablePtr;
     uint8_t vLpiIDBits;
     Addr vLpiPendingTablePtr;
+    bool vLpiPendingTableValid;
+    uint16_t residentVpeId;
+    Addr residentVptAddr;
 
     BitUnion8(LPIConfigurationTableEntry)
         Bitfield<7, 2> priority;
@@ -231,12 +234,32 @@ class Gicv3Redistributor : public Serializable
         return cpuId;
     }
 
+    uint16_t
+    residentVPEID() const
+    {
+        return residentVpeId;
+    }
+
+    Addr
+    residentVPTAddr() const
+    {
+        return residentVptAddr;
+    }
+
     Gicv3::GroupId getIntGroup(int int_id) const;
     Gicv3::IntStatus intStatus(uint32_t int_id) const;
     uint8_t readEntryLPI(uint32_t intid);
     void writeEntryLPI(uint32_t intid, uint8_t lpi_entry);
     bool isPendingLPI(uint32_t intid);
     void setClrLPI(uint64_t data, bool set);
+    bool injectOrPendVLPI(uint16_t vpeId, uint32_t vintId,
+                          Addr vptAddr, uint8_t vptIdBits,
+                          uint32_t doorbellIntid,
+                          Gicv3::GroupId group);
+    bool isPendingVLPI(Addr vptAddr, uint32_t vintId);
+    void setClrVLPI(Addr vptAddr, uint32_t vintId, bool set);
+    bool isVPEResident(uint16_t vpeId, Addr vptAddr) const;
+    void syncPendingVLPI(uint16_t vpeId, Addr vptAddr, uint8_t vptIdBits);
     void sendSGI(uint32_t int_id, Gicv3::GroupId group, bool ns);
     void serialize(CheckpointOut & cp) const override;
     void unserialize(CheckpointIn & cp) override;
