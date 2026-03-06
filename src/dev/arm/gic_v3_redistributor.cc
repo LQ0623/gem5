@@ -173,9 +173,10 @@ Gicv3Redistributor::read(Addr addr, size_t size, bool is_secure_access)
            */
           uint64_t affinity = getAffinity();
           int last = cpuId == (gic->getSystem()->threads.size() - 1);
-          uint64_t vlpis = gic->params().gicv4 ? (1 << 1) : 0;
+          uint64_t vlpis = gic->params().gicv4 ? (1ULL << 1) : 0;
+          uint64_t rvpeid = gic->params().gicv4 ? (1ULL << 7) : 0;
           return (affinity << 32) | (1 << 24) | (cpuId << 8) |
-              (1 << 5) | (last << 4) | (1 << 3) | vlpis | (1 << 0);
+              (1ULL << 5) | (last << 4) | (1ULL << 3) | rvpeid | vlpis | (1ULL << 0);
       }
 
       case GICR_WAKER: // Wake Register
@@ -391,9 +392,15 @@ Gicv3Redistributor::read(Addr addr, size_t size, bool is_secure_access)
         return ((uint64_t)vpeResident << 63) | (residentVpeId & 0xFFFF);
 
       case GICR_VSGIPENDR:
+        if (!vpeResident) {
+            return 0;
+        }
         return vsgiPendingByVpe[residentVpeId & 0xFFFF];
 
       case GICR_VSGIACTIVER:
+        if (!vpeResident) {
+            return 0;
+        }
         return vsgiActiveByVpe[residentVpeId & 0xFFFF];
 
       default:
@@ -733,12 +740,18 @@ Gicv3Redistributor::write(Addr addr, uint64_t data, size_t size,
         break;
 
       case GICR_VSGIPENDR:
+        if (!vpeResident) {
+            return;
+        }
         vsgiPendingByVpe[residentVpeId & 0xFFFF] = data & 0xFFFF;
         directVlpiDirty = true;
         updateDistributor();
         break;
 
       case GICR_VSGIACTIVER:
+        if (!vpeResident) {
+            return;
+        }
         vsgiActiveByVpe[residentVpeId & 0xFFFF] = data & 0xFFFF;
         break;
 

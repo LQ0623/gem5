@@ -207,6 +207,7 @@ class Gicv3Its : public BasicPioDevice
     BitUnion64(TYPER)
         Bitfield<63, 32> high;
         Bitfield<31, 0> low;
+        Bitfield<39> vsgi;
         Bitfield<37> vmovp;
         Bitfield<36> cil;
         Bitfield<35, 32> cidBits;

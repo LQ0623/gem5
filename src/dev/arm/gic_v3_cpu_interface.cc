@@ -958,7 +958,11 @@ Gicv3CPUInterface::setMiscReg(int misc_reg, RegVal val)
           if (lr_idx < 0) {
               ICH_HCR_EL2 ich_hcr = isa->readMiscRegNoEffect(MISCREG_ICH_HCR_EL2);
               if (int_id < 16 && ich_hcr.TC == 0) {
-                  DPRINTF(GIC, "vSGI: Direct EOI on EOIR0 without LR (Guest Bug/Ignored).\n");
+                  if (!virtualIsEOISplitMode()) {
+                      redistributor->clearVsgiActive(
+                          redistributor->residentVpeId & 0xFFFF, int_id);
+                  }
+                  DPRINTF(GIC, "vSGI: Direct EOI without LR.\n");
               } else if (int_id < Gicv3Redistributor::SMALLEST_LPI_ID) {
                   virtualIncrementEOICount();
               }
@@ -1041,8 +1045,10 @@ Gicv3CPUInterface::setMiscReg(int misc_reg, RegVal val)
           if (lr_idx < 0) {
               ICH_HCR_EL2 ich_hcr = isa->readMiscRegNoEffect(MISCREG_ICH_HCR_EL2);
               if (int_id < 16 && ich_hcr.TC == 0) {
-                  redistributor->clearVsgiActive(
-                      redistributor->residentVpeId & 0xFFFF, int_id);
+                  if (!virtualIsEOISplitMode()) {
+                      redistributor->clearVsgiActive(
+                          redistributor->residentVpeId & 0xFFFF, int_id);
+                  }
                   // Direct vSGIs are not in the List Registers; do not increment EOIcount
                   DPRINTF(GIC, "vSGI: Direct EOI without LR.\n");
               } else if (int_id < Gicv3Redistributor::SMALLEST_LPI_ID) {
@@ -2986,7 +2992,7 @@ Gicv3CPUInterface::simulateHypervisorTrap(RegVal val, Gicv3::GroupId group)
             }
         }
 
-        if (free_lr_idx >= 0) {
+        if (!injected && free_lr_idx >= 0) {
             ICH_LR_EL2 ich_lr_el2 = 0;
 
             // HACK: This bypasses architectural EL2 trap delivery and

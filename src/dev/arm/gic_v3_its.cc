@@ -704,14 +704,7 @@ ItsCommand::inv(Yield &yield, CommandEntry &command)
     }
 
     if (itte.intType == Gicv3Its::VIRTUAL_INTERRUPT) {
-        VPETE vpete = readVpeTable(yield, itte.vpeid);
-        if (!vpete.valid) {
-            its.incrementReadPointer();
-            terminate(yield);
-        }
-        auto *rd = its.getRedistributor(vpete.rdBase);
-        rd->markDirectVlpiDirty();
-        rd->updateDistributor();
+        its.markVpeDirty(itte.vpeid & 0xFFFF);
     } else {
         const auto collection_id = itte.icid;
         CTE cte = readIrqCollectionTable(yield, collection_id);
@@ -1109,6 +1102,7 @@ Gicv3Its::setGIC(Gicv3 *_gic)
         gitsTyper.physical = 1;
         gitsTyper.seis = 1;
         gitsTyper.cct = 1;
+        gitsTyper.vsgi = 1;
     }
 }
 
