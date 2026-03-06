@@ -57,6 +57,53 @@
 namespace gem5
 {
 
+namespace
+{
+
+inline void
+packITTE(const ItsProcess::ITTE &itte, uint64_t *raw)
+{
+    raw[0] = itte.intNum;
+    raw[1] = itte.intNumHyp;
+    raw[2] = itte.vpeid;
+    raw[3] = itte.icid;
+    replaceBits(raw[3], 32, 32, itte.intType);
+    replaceBits(raw[3], 33, 33, itte.valid ? 1 : 0);
+}
+
+inline ItsProcess::ITTE
+unpackITTE(const uint64_t *raw)
+{
+    ItsProcess::ITTE itte;
+    itte.intNum = raw[0];
+    itte.intNumHyp = raw[1];
+    itte.vpeid = raw[2];
+    itte.icid = bits(raw[3], 31, 0);
+    itte.intType = bits(raw[3], 32, 32);
+    itte.valid = bits(raw[3], 33, 33);
+    return itte;
+}
+
+inline void
+packVPETE(const ItsProcess::VPETE &vpete, uint64_t *raw)
+{
+    raw[0] = vpete.rdBase;
+    raw[1] = vpete.vptAddr;
+    raw[2] = vpete.valid ? 1 : 0;
+}
+
+inline ItsProcess::VPETE
+unpackVPETE(const uint64_t *raw)
+{
+    ItsProcess::VPETE vpete;
+    vpete.rdBase = raw[0];
+    vpete.vptAddr = raw[1];
+    vpete.valid = raw[2] & 0x1;
+    return vpete;
+}
+
+} // anonymous namespace
+
 const AddrRange Gicv3Its::GITS_BASER(0x0100, 0x0140);
 
 const uint32_t Gicv3Its::CTLR_QUIESCENT = 0x80000000;
@@ -164,11 +211,18 @@ void
 ItsProcess::writeIrqTranslationTable(
     Yield &yield, const Addr itt_base, uint32_t event_id, ITTE itte)
 {
-    const Addr address = itt_base + (event_id * sizeof(itte));
+    uint64_t raw[4];
+    packITTE(itte, raw);
 
-    doWrite(yield, address, &itte, sizeof(itte));
+    const Addr address = itt_base + (event_id * sizeof(raw));
 
-    DPRINTF(ITS, "Writing ITTE at address %#x: %#x\n", address, itte);
+    doWrite(yield, address, raw, sizeof(raw));
+
+    DPRINTF(ITS,
+            "Writing ITTE at address %#x: intNum=%#x intNumHyp=%#x vpeid=%#x "
+            "icid=%#x type=%u valid=%u\n",
+            address, itte.intNum, itte.intNumHyp, itte.vpeid, itte.icid,
+            itte.intType, itte.valid);
 }
 
 void
@@ -196,16 +250,21 @@ ItsProcess::readDeviceTable(Yield &yield, uint32_t device_id)
     return dte;
 }
 
-uint64_t
+ItsProcess::ITTE
 ItsProcess::readIrqTranslationTable(
     Yield &yield, const Addr itt_base, uint32_t event_id)
 {
-    uint64_t itte;
-    const Addr address = itt_base + (event_id * sizeof(itte));
+    uint64_t raw[4] = {0, 0, 0, 0};
+    const Addr address = itt_base + (event_id * sizeof(raw));
 
-    doRead(yield, address, &itte, sizeof(itte));
+    doRead(yield, address, raw, sizeof(raw));
 
-    DPRINTF(ITS, "Reading ITTE at address %#x: %#x\n", address, itte);
+    ITTE itte = unpackITTE(raw);
+    DPRINTF(ITS,
+            "Reading ITTE at address %#x: intNum=%#x intNumHyp=%#x vpeid=%#x "
+            "icid=%#x type=%u valid=%u\n",
+            address, itte.intNum, itte.intNumHyp, itte.vpeid, itte.icid,
+            itte.intType, itte.valid);
     return itte;
 }
 
@@ -225,26 +284,29 @@ ItsProcess::readIrqCollectionTable(Yield &yield, uint32_t collection_id)
 void
 ItsProcess::writeVpeTable(Yield &yield, uint32_t vpe_id, VPETE vpete)
 {
-    const Addr base = its.pageAddress(Gicv3Its::VPE_TABLE);
-    const Addr address = base + (vpe_id * sizeof(vpete));
+    uint64_t raw[3];
+    packVPETE(vpete, raw);
 
-    doWrite(yield, address, &vpete, sizeof(vpete));
+    const Addr base = its.pageAddress(Gicv3Its::VPE_TABLE);
+    const Addr address = base + (vpe_id * sizeof(raw));
+
+    doWrite(yield, address, raw, sizeof(raw));
 
     DPRINTF(ITS,
             "Writing VPETE at address %#x: rdBase=%#x vptAddr=%#x valid=%u\n",
-            address, (uint64_t)vpete.rdBase,
-            (uint64_t)vpete.vptAddr, (uint64_t)vpete.valid);
+            address, vpete.rdBase, vpete.vptAddr, vpete.valid);
 }
 
 ItsProcess::VPETE
 ItsProcess::readVpeTable(Yield &yield, uint32_t vpe_id)
 {
-    VPETE vpete = 0;
+    uint64_t raw[3] = {0, 0, 0};
     const Addr base = its.pageAddress(Gicv3Its::VPE_TABLE);
-    const Addr address = base + (vpe_id * sizeof(vpete));
+    const Addr address = base + (vpe_id * sizeof(raw));
 
-    doRead(yield, address, &vpete, sizeof(vpete));
+    doRead(yield, address, raw, sizeof(raw));
 
+    VPETE vpete = unpackVPETE(raw);
     DPRINTF(ITS,
             "Reading VPETE at address %#x: rdBase=%#x vptAddr=%#x valid=%u\n",
             address, vpete.rdBase, vpete.vptAddr, vpete.valid);
@@ -584,7 +646,7 @@ ItsCommand::doInt(Yield &yield, CommandEntry &command)
     }
 
     Gicv3Redistributor *redist = nullptr;
-    VPETE vpete = 0;
+    VPETE vpete;
 
     if (itte.intType == Gicv3Its::VIRTUAL_INTERRUPT) {
         vpete = readVpeTable(yield, itte.vpeid);
@@ -898,8 +960,8 @@ ItsCommand::vmapi(Yield &yield, CommandEntry &command)
     itte.valid = 1;
     itte.intType = Gicv3Its::VIRTUAL_INTERRUPT;
     itte.intNum = command.eventId;
-    itte.intNumHyp = bits(command.raw[1], 63, 32);
-    itte.vpeid = bits(command.raw[2], 15, 0);
+    itte.intNumHyp = command.eventId;
+    itte.vpeid = bits(command.raw[2], 47, 32);
 
     writeIrqTranslationTable(yield, dte.ittAddress, command.eventId, itte);
 }
@@ -908,12 +970,12 @@ void
 ItsCommand::vmapp(Yield &yield, CommandEntry &command)
 {
     // 中文说明：按 IHI0069 重新解析 VMAPP 位域。
-    const uint32_t vpe_id = bits(command.raw[1], 15, 0);
+    const uint32_t vpe_id = bits(command.raw[1], 47, 32);
     const uint64_t rd_base = bits(command.raw[2], 50, 16);
     const uint64_t vpt_addr = bits(command.raw[3], 51, 16);
     const bool valid = bits(command.raw[3], 63);
 
-    VPETE vpete = 0;
+    VPETE vpete;
     vpete.valid = valid;
     vpete.rdBase = rd_base;
     vpete.vptAddr = vpt_addr;
@@ -931,7 +993,7 @@ ItsCommand::vmapti(Yield &yield, CommandEntry &command)
 
     DTE dte = readDeviceTable(yield, command.deviceId);
 
-    const uint32_t pintid = bits(command.raw[1], 63, 32);
+    const uint32_t pintid = bits(command.raw[3], 31, 0);
     const uint32_t vintid = bits(command.raw[2], 31, 0);
     const uint32_t vpeid = bits(command.raw[2], 47, 32);
 
@@ -983,15 +1045,16 @@ ItsCommand::vmovi(Yield &yield, CommandEntry &command)
 void
 ItsCommand::vmovp(Yield &yield, CommandEntry &command)
 {
-    const uint64_t rd1 = bits(command.raw[2], 50, 16);
-    const uint64_t rd2 = bits(command.raw[3], 50, 16);
+    const uint32_t vpe_id = bits(command.raw[1], 47, 32);
+    const uint64_t rd_base = bits(command.raw[3], 50, 16);
 
-    if (rd1 != rd2) {
-        Gicv3Redistributor * redist1 = its.getRedistributor(rd1);
-        Gicv3Redistributor * redist2 = its.getRedistributor(rd2);
-
-        its.moveAllPendingState(redist1, redist2);
+    VPETE vpete = readVpeTable(yield, vpe_id);
+    if (!vpete.valid) {
+        return;
     }
+
+    vpete.rdBase = rd_base;
+    writeVpeTable(yield, vpe_id, vpete);
 }
 
 void
@@ -1025,7 +1088,7 @@ Gicv3Its::Gicv3Its(const Gicv3ItsParams &params)
 
     BASER vpe_baser = 0;
     vpe_baser.type = VPE_TABLE;
-    vpe_baser.entrySize = sizeof(uint64_t) - 1;
+    vpe_baser.entrySize = (sizeof(uint64_t) * 3) - 1;
     tableBases[1] = vpe_baser;
 
     BASER icollect_baser = 0;
@@ -1489,6 +1552,29 @@ Gicv3Its::getRedistributor(uint64_t rd_base)
         // RDBase is a redistributor number
         return gic->getRedistributor(rd_base);
     }
+}
+
+bool
+Gicv3Its::readVpe(uint32_t vpe_id, VPETE &vpete)
+{
+    auto base_it = std::find_if(
+        tableBases.begin(), tableBases.end(),
+        [] (const BASER &b) { return b.type == VPE_TABLE; }
+    );
+
+    if (base_it == tableBases.end()) {
+        return false;
+    }
+
+    const Addr base = pageAddress(VPE_TABLE);
+    const Addr address = base + (vpe_id * (sizeof(uint64_t) * 3));
+    uint64_t raw[3] = {0, 0, 0};
+    gic->getSystem()->physProxy.readBlob(address, raw, sizeof(raw));
+
+    vpete.rdBase = raw[0];
+    vpete.vptAddr = raw[1];
+    vpete.valid = raw[2] & 0x1;
+    return true;
 }
 
 Addr

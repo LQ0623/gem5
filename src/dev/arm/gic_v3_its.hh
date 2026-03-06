@@ -277,33 +277,36 @@ class Gicv3Its : public BasicPioDevice
         Bitfield<0> valid;
     EndBitUnion(DTE)
 
-    BitUnion64(ITTE)
-        Bitfield<59, 46> vpeid;
-        Bitfield<45, 30> icid;
-        Bitfield<29, 16> intNumHyp;
-        Bitfield<15, 2> intNum;
-        Bitfield<1> intType;
-        Bitfield<0> valid;
-    EndBitUnion(ITTE)
+    struct ITTE
+    {
+        uint32_t intNum = 0;
+        uint32_t intNumHyp = 0;
+        uint32_t vpeid = 0;
+        uint32_t icid = 0;
+        uint8_t intType = 0;
+        bool valid = false;
+    };
 
     BitUnion64(CTE)
         Bitfield<40, 1> rdBase;
         Bitfield<0> valid;
     EndBitUnion(CTE)
 
-    // 中文说明：VPETE 必须保持 64bit（8 字节）大小，和 BASER entrySize 对齐。
-    // 这里使用压缩位域，避免普通 struct 因对齐变成 24 字节导致越界写表。
-    BitUnion64(VPETE)
-        Bitfield<63> valid;
-        Bitfield<51, 16> vptAddr; // 36-bit 页基址字段
-        Bitfield<15, 0> rdBase;   // 16-bit RD 路由字段
-    EndBitUnion(VPETE)
+    struct VPETE
+    {
+        uint64_t rdBase = 0;
+        uint64_t vptAddr = 0;
+        bool valid = false;
+    };
 
     enum InterruptType
     {
         VIRTUAL_INTERRUPT = 0,
         PHYSICAL_INTERRUPT = 1
     };
+
+  public:
+    bool readVpe(uint32_t vpe_id, VPETE &vpete);
 
   private:
     Gicv3Redistributor* getRedistributor(uint64_t rd_base);
@@ -395,7 +398,7 @@ class ItsProcess : public Packet::SenderState
     uint64_t readDeviceTable(
         Yield &yield, uint32_t device_id);
 
-    uint64_t readIrqTranslationTable(
+    ITTE readIrqTranslationTable(
         Yield &yield, const Addr itt_base, uint32_t event_id);
 
     uint64_t readIrqCollectionTable(Yield &yield, uint32_t collection_id);

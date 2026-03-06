@@ -716,7 +716,7 @@ Gicv3Redistributor::write(Addr addr, uint64_t data, size_t size,
 
       case GICR_VPENDBASER:
         // 中文说明：解析驻留位和 vPEID，用于 direct vLPI 驻留裁决。
-        vLpiPendingTablePtr = data & 0xFFFFFFFFFF0000ULL;
+        vLpiPendingTablePtr = data & 0x0000FFFFFFFF0000ULL;
         vpeResident = (data & (1ULL << 63)) != 0;
         residentVpeId = data & 0xFFFF;
         updateDistributor();
@@ -940,7 +940,7 @@ Gicv3Redistributor::update()
             const uint32_t largest_vlpi_id = 1 << (vLpiIDBits + 1);
             if (largest_vlpi_id >= SMALLEST_LPI_ID) {
                 const uint32_t number_vlpis =
-                    largest_vlpi_id - SMALLEST_LPI_ID + 1;
+                    largest_vlpi_id - SMALLEST_LPI_ID;
                 const size_t table_size = largest_vlpi_id / 8;
                 auto vlpi_pending_table =
                     std::make_unique<uint8_t[]>(table_size);

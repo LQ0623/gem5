@@ -44,6 +44,7 @@
 #include "arch/arm/isa.hh"
 #include "debug/GIC.hh"
 #include "dev/arm/gic_v3.hh"
+#include "dev/arm/gic_v3_its.hh"
 #include "dev/arm/gic_v3_distributor.hh"
 #include "dev/arm/gic_v3_redistributor.hh"
 
@@ -311,18 +312,37 @@ Gicv3CPUInterface::readMiscReg(int misc_reg)
 
       // Virtual Highest Priority Pending Interrupt Register 1
       case MISCREG_ICV_HPPIR1_EL1: {
-          value = Gicv3::INTID_SPURIOUS;
           int lr_idx = getHPPVILR();
+          uint8_t lr_prio = 0xff;
+          bool lr_group1 = false;
+          bool lr_can_preempt = false;
 
           if (lr_idx >= 0) {
               ICH_LR_EL2 ich_lr_el2 =
                   isa->readMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx);
-              Gicv3::GroupId group =
-                  ich_lr_el2.Group ? Gicv3::G1NS : Gicv3::G0S;
+              lr_prio = ich_lr_el2.Priority;
+              lr_group1 = ich_lr_el2.Group;
+              lr_can_preempt = hppviCanPreempt(lr_idx);
+          }
 
-              if (group == Gicv3::G1NS) {
-                  value = ich_lr_el2.vINTID;
-              }
+          if (!lr_can_preempt) {
+              lr_prio = 0xff;
+          }
+
+          const bool direct_valid = hppviDirectCanPreempt();
+          const uint8_t direct_prio = direct_valid ? hppvi_direct.prio : 0xff;
+          const bool direct_is_highest = direct_valid &&
+              (direct_prio < lr_prio || (direct_prio == lr_prio && lr_group1));
+          const bool lr_is_highest = lr_can_preempt &&
+              (lr_prio < direct_prio || (lr_prio == direct_prio && !lr_group1));
+
+          value = Gicv3::INTID_SPURIOUS;
+          if (direct_is_highest) {
+              value = hppvi_direct.intid;
+          } else if (lr_is_highest && lr_group1) {
+              ICH_LR_EL2 ich_lr_el2 =
+                  isa->readMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx);
+              value = ich_lr_el2.vINTID;
           }
 
           break;
@@ -511,10 +531,15 @@ Gicv3CPUInterface::readMiscReg(int misc_reg)
               lr_can_preempt = hppviCanPreempt(lr_idx);
           }
 
+          if (!lr_can_preempt) {
+              lr_prio = 0xff;
+          }
+
           const bool direct_valid = hppviDirectCanPreempt();
           uint8_t direct_prio = direct_valid ? hppvi_direct.prio : 0xff;
 
-          bool direct_is_highest = direct_valid && (direct_prio < lr_prio || (direct_prio == lr_prio && lr_group1));
+          bool direct_is_highest = direct_valid &&
+              (direct_prio < lr_prio || (direct_prio == lr_prio && lr_group1));
           bool lr_is_highest = lr_can_preempt && (lr_prio < direct_prio || (lr_prio == direct_prio && !lr_group1));
 
           uint32_t int_id = Gicv3::INTID_SPURIOUS;
@@ -2789,39 +2814,63 @@ Gicv3CPUInterface::generateVSGI(RegVal val, Gicv3::GroupId group)
 {
     (void)group;
 
-    uint8_t aff3 = bits(val, 55, 48);
-    uint8_t aff2 = bits(val, 39, 32);
-    uint8_t aff1 = bits(val, 23, 16);
-    uint16_t target_list = bits(val, 15, 0);
-    uint32_t int_id = bits(val, 27, 24);
-    bool irm = bits(val, 40, 40);
-    uint8_t rs = bits(val, 47, 44);
+    const uint8_t aff3 = bits(val, 55, 48);
+    const uint8_t aff2 = bits(val, 39, 32);
+    const uint8_t aff1 = bits(val, 23, 16);
+    const uint16_t target_list = bits(val, 15, 0);
+    const uint32_t int_id = bits(val, 27, 24);
+    const bool irm = bits(val, 40, 40);
+    const uint8_t rs = bits(val, 47, 44);
 
-    for (int i = 0; i < gic->getSystem()->threads.size(); i++) {
-        Gicv3Redistributor * redist_i = gic->getRedistributor(i);
-        uint32_t affinity_i = redist_i->getAffinity();
-
-        if (irm) {
-            if (affinity_i == redistributor->getAffinity()) continue;
-        } else {
-            if ((affinity_i >> 8) != ((aff3 << 16) | (aff2 << 8) | (aff1 << 0))) continue;
-            uint8_t aff0_i = bits(affinity_i, 7, 0);
-            if (!(aff0_i >= rs * 16 && aff0_i < (rs + 1) * 16 &&
-                ((0x1 << (aff0_i - rs * 16)) & target_list))) continue;
+    auto injectVpe = [&](uint32_t target_vpeid) {
+        Gicv3Its::VPETE vpete;
+        if (!gic->its || !gic->its->readVpe(target_vpeid, vpete) || !vpete.valid) {
+            return;
         }
 
-        uint32_t target_vpeid = i;
-        DPRINTF(GIC, "vSGI: Direct injecting INTID %d to vPE %d\n", int_id, target_vpeid);
+        Gicv3Redistributor *target_redist = nullptr;
+        for (int i = 0; i < gic->getSystem()->threads.size(); i++) {
+            auto *rd = gic->getRedistributor(i);
+            if (rd->vpeResident && rd->residentVpeId == target_vpeid) {
+                target_redist = rd;
+                break;
+            }
+        }
 
-        // Reuse VLPI direct injection method for vSGI
-        // FIXME: For Non-Resident vPEs, vpt_addr is hardcoded as 0.
-        // This causes the vSGI to be silently dropped if the vPE is not currently scheduled.
-        // A complete fix requires querying the ITS VPE table for the actual vpt_addr.
-        redist_i->setClrVLPI(int_id, target_vpeid, 0, true);
+        if (!target_redist) {
+            target_redist = redistributor;
+        }
 
-        if (!redist_i->vpeResident || redist_i->residentVpeId != target_vpeid) {
+        DPRINTF(GIC, "vSGI: Direct injecting INTID %d to vPE %d\n",
+                int_id, target_vpeid);
+        target_redist->setClrVLPI(int_id, target_vpeid, vpete.vptAddr, true);
+
+        if (!target_redist->vpeResident ||
+            target_redist->residentVpeId != target_vpeid) {
             triggerDoorbell(target_vpeid);
         }
+    };
+
+    if (irm) {
+        for (int i = 0; i < gic->getSystem()->threads.size(); i++) {
+            auto *rd = gic->getRedistributor(i);
+            if (rd == redistributor) {
+                continue;
+            }
+            injectVpe(rd->residentVpeId);
+        }
+        return;
+    }
+
+    for (uint32_t target_idx = 0; target_idx < 16; target_idx++) {
+        if ((target_list & (1U << target_idx)) == 0) {
+            continue;
+        }
+
+        const uint32_t aff0 = rs * 16 + target_idx;
+        const uint32_t target_vpeid =
+            (aff3 << 24) | (aff2 << 16) | (aff1 << 8) | aff0;
+        injectVpe(target_vpeid);
     }
 }
 
