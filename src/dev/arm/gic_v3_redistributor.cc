@@ -987,11 +987,6 @@ Gicv3Redistributor::setClrLPI(uint64_t data, bool set)
     uint8_t lpi_pending_entry_bit_position = lpi_id % 8;
     bool is_set = lpi_pending_entry & (1 << lpi_pending_entry_bit_position);
 
-    const bool clearResidentLr = !set && vLpiPendingTableValid &&
-        residentVpeId != 0xffff && residentVptAddr == vptAddr;
-    DPRINTF(GIC, "setClrVLPI cpu=%u vintid=%u set=%d vpt=%#llx resident_vpe=%u resident_vpt=%#llx clear_lr=%d\n",
-            cpuId, vintId, set, (unsigned long long)vptAddr, residentVpeId,
-            (unsigned long long)residentVptAddr, clearResidentLr);
     if (set) {
         if (is_set) {
             // Writes to GICR_SETLPIR have not effect if the pINTID field
@@ -1120,7 +1115,22 @@ Gicv3Redistributor::injectOrPendVLPI(uint16_t vpeId, uint32_t vintId,
 
     DPRINTF(GIC, "injectOrPendVLPI cpu=%u vintid=%u action=delivered_clear_pending\n",
             cpuId, vintId);
-    setClrVLPI(vptAddr, vintId, false);
+    /*
+     * Direct-injection delivery semantics:
+     * - clear the vPT pending bit after successful LR injection
+     * - but do NOT clear resident LR pending state here.
+     *
+     * setClrVLPI(..., false) is used by CLEAR/DISCARD style maintenance
+     * commands and may clear resident LR state (via clearPendingVirtualLPI).
+     * Using it here would erase the just-delivered LR before EL1 sees it.
+     */
+    if (vptAddr && vintId >= SMALLEST_LPI_ID) {
+        const Addr pendingByteAddr = vptAddr + (vintId / 8);
+        uint8_t pendingByte = memProxy->read<uint8_t>(pendingByteAddr);
+        pendingByte &= ~(1 << (vintId % 8));
+        memProxy->writeBlob(pendingByteAddr, &pendingByte,
+            sizeof(pendingByte));
+    }
     return true;
 }
 
