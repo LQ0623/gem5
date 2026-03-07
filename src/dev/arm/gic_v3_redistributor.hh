@@ -190,8 +190,21 @@ class Gicv3Redistributor : public Serializable
     uint8_t vLpiIDBits;
     Addr vLpiPendingTablePtr;
     bool vLpiPendingTableValid;
+    bool vLpiPendingTableDirty;
+    bool vLpiPendingLast;
     uint16_t residentVpeId;
     Addr residentVptAddr;
+
+    static constexpr uint64_t GICR_VPENDBASER_DIRTY = 1ULL << 60;
+    static constexpr uint64_t GICR_VPENDBASER_PENDING_LAST = 1ULL << 61;
+    static constexpr uint64_t GICR_VPENDBASER_VALID = 1ULL << 63;
+
+    bool residentLrHasPendingState() const;
+    void syncResidentPendingStateToVpt();
+    bool vptHasPendingState() const;
+    uint64_t vpendbaserReadValue() const;
+    void scheduleVpeOn(uint64_t data);
+    void scheduleVpeOff();
 
     BitUnion8(LPIConfigurationTableEntry)
         Bitfield<7, 2> priority;

@@ -41,8 +41,10 @@
 #include "dev/arm/gic_v3_redistributor.hh"
 #include <algorithm>
 
+#include "arch/arm/isa.hh"
 #include "arch/arm/utility.hh"
 #include "base/compiler.hh"
+#include "base/logging.hh"
 #include "debug/GIC.hh"
 #include "dev/arm/gic_v3_cpu_interface.hh"
 #include "dev/arm/gic_v3_distributor.hh"
@@ -83,6 +85,8 @@ Gicv3Redistributor::Gicv3Redistributor(Gicv3 * gic, uint32_t cpu_id)
       vLpiIDBits(0),
       vLpiPendingTablePtr(0),
       vLpiPendingTableValid(false),
+      vLpiPendingTableDirty(false),
+      vLpiPendingLast(false),
       residentVpeId(0xffff),
       residentVptAddr(0),
       addrRangeSize(gic->params().gicv4 ? 0x40000 : 0x20000)
@@ -390,8 +394,7 @@ Gicv3Redistributor::read(Addr addr, size_t size, bool is_secure_access)
         return vLpiConfigurationTablePtr | vLpiIDBits;
 
       case GICR_VPENDBASER:
-        return vLpiPendingTablePtr |
-            (vLpiPendingTableValid ? (1ULL << 63) : 0);
+        return vpendbaserReadValue();
 
       default:
         gic->reserved("Gicv3Redistributor::read(): invalid offset %#x\n", addr);
@@ -722,20 +725,40 @@ Gicv3Redistributor::write(Addr addr, uint64_t data, size_t size,
           break;
       }
 
-      case GICR_VPENDBASER:
-        vLpiPendingTablePtr = data & 0xFFFFFFFFF0000;
-        vLpiPendingTableValid = bits(data, 63);
-        residentVptAddr = vLpiPendingTableValid ? vLpiPendingTablePtr : 0;
-        residentVpeId = 0xffff;
-        DPRINTF(GIC, "GICR_VPENDBASER cpu=%u valid=%d vpt=%#llx resident_vpe=%u\n",
-                cpuId, vLpiPendingTableValid,
-                (unsigned long long)residentVptAddr, residentVpeId);
-        if (gic->getIts() && vLpiPendingTableValid) {
-            gic->getIts()->findVPEForRedistributor(this, residentVptAddr,
-                                                 residentVpeId);
-            gic->getIts()->syncPendingVirtualLpis(this);
+      case GICR_VPENDBASER: {
+        const bool oldValid = vLpiPendingTableValid;
+        const bool newValid = bits(data, 63);
+
+        if (oldValid && newValid) {
+            const uint64_t oldNonValid = vpendbaserReadValue() &
+                ~GICR_VPENDBASER_VALID;
+            const uint64_t newNonValid = data & ~GICR_VPENDBASER_VALID;
+            if (oldNonValid != newNonValid) {
+                warn("GICR_VPENDBASER cpu=%u write while Valid=1 "
+                     "changed non-Valid fields; ignored\n", cpuId);
+            }
+            break;
         }
+
+        if (oldValid && !newValid) {
+            scheduleVpeOff();
+            break;
+        }
+
+        if (!oldValid && newValid) {
+            scheduleVpeOn(data);
+            break;
+        }
+
+        /*
+         * Valid == 0 -> no vPE scheduled.
+         * Software may prepare a future schedule-on value while idle.
+         */
+        vLpiPendingTablePtr = data & 0xFFFFFFFFF0000ULL;
+        residentVptAddr = 0;
+        residentVpeId = 0xffff;
         break;
+      }
 
       case GICR_INVLPIR: { // Redistributor Invalidate LPI Register
           // Do nothing: no caching supported
@@ -1013,6 +1036,187 @@ Gicv3Redistributor::setClrLPI(uint64_t data, bool set)
     updateDistributor();
 }
 
+uint64_t
+Gicv3Redistributor::vpendbaserReadValue() const
+{
+    uint64_t value = vLpiPendingTablePtr;
+    if (vLpiPendingTableDirty) {
+        value |= GICR_VPENDBASER_DIRTY;
+    }
+    if (vLpiPendingLast) {
+        value |= GICR_VPENDBASER_PENDING_LAST;
+    }
+    if (vLpiPendingTableValid) {
+        value |= GICR_VPENDBASER_VALID;
+    }
+    return value;
+}
+
+bool
+Gicv3Redistributor::residentLrHasPendingState() const
+{
+    if (!vLpiPendingTableValid || residentVptAddr == 0) {
+        return false;
+    }
+
+    for (int lrIdx = 0; lrIdx < Gicv3CPUInterface::VIRTUAL_NUM_LIST_REGS;
+         lrIdx++) {
+        const uint64_t lrRaw =
+                cpuInterface->isa->readMiscRegNoEffect(
+                    MISCREG_ICH_LR0_EL2 + lrIdx);
+        const uint64_t state = bits(lrRaw, 63, 62);
+        const uint32_t vintId = bits(lrRaw, 31, 0);
+        if ((state == Gicv3CPUInterface::ICH_LR_EL2_STATE_PENDING ||
+             state == Gicv3CPUInterface::ICH_LR_EL2_STATE_ACTIVE_PENDING) &&
+            vintId >= SMALLEST_LPI_ID) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void
+Gicv3Redistributor::syncResidentPendingStateToVpt()
+{
+    if (!vLpiPendingTableValid || residentVptAddr == 0) {
+        return;
+    }
+
+    bool lrUpdated = false;
+
+    /*
+     * Minimal deschedule sync:
+     * Any resident LR still carrying a pending component gets reflected back
+     * into the vPT so later schedule-on can replay it.
+     */
+    for (int lrIdx = 0; lrIdx < Gicv3CPUInterface::VIRTUAL_NUM_LIST_REGS;
+         lrIdx++) {
+        uint64_t lrRaw =
+            cpuInterface->isa->readMiscRegNoEffect(
+                MISCREG_ICH_LR0_EL2 + lrIdx);
+        const uint64_t state = bits(lrRaw, 63, 62);
+        const uint32_t vintId = bits(lrRaw, 31, 0);
+
+        if ((state != Gicv3CPUInterface::ICH_LR_EL2_STATE_PENDING) &&
+            (state != Gicv3CPUInterface::ICH_LR_EL2_STATE_ACTIVE_PENDING)) {
+            continue;
+        }
+
+        if (vintId < SMALLEST_LPI_ID) {
+            continue;
+        }
+
+        setClrVLPI(residentVptAddr, vintId, true);
+
+        if (state == Gicv3CPUInterface::ICH_LR_EL2_STATE_PENDING) {
+            lrRaw = insertBits(lrRaw, 63, 62,
+                Gicv3CPUInterface::ICH_LR_EL2_STATE_INVALID);
+        } else {
+            lrRaw = insertBits(lrRaw, 63, 62,
+                Gicv3CPUInterface::ICH_LR_EL2_STATE_ACTIVE);
+        }
+
+        cpuInterface->isa->setMiscRegNoEffect(
+            MISCREG_ICH_LR0_EL2 + lrIdx, lrRaw);
+        lrUpdated = true;
+    }
+
+    if (lrUpdated) {
+        cpuInterface->virtualUpdate();
+    }
+}
+
+bool
+Gicv3Redistributor::vptHasPendingState() const
+{
+    if (vLpiPendingTablePtr == 0 || vLpiIDBits > 0xf) {
+        return false;
+    }
+
+    const uint32_t maxVintId = 1u << (vLpiIDBits + 1);
+    if (maxVintId <= SMALLEST_LPI_ID) {
+        return false;
+    }
+
+    for (uint32_t vint = SMALLEST_LPI_ID; vint < maxVintId; vint += 8) {
+        const uint8_t pendingByte = memProxy->read<uint8_t>(
+            vLpiPendingTablePtr + (vint / 8));
+        uint8_t mask = 0xff;
+        if (vint + 8 > maxVintId) {
+            mask = (1u << (maxVintId - vint)) - 1u;
+        }
+        if (pendingByte & mask) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void
+Gicv3Redistributor::scheduleVpeOn(uint64_t data)
+{
+    vLpiPendingTablePtr = data & 0xFFFFFFFFF0000ULL;
+    vLpiPendingTableValid = true;
+    vLpiPendingTableDirty = false;
+    residentVptAddr = vLpiPendingTablePtr;
+    residentVpeId = bits(data, 15, 0);
+
+    auto *its = gic->getIts();
+    if (its) {
+        uint16_t matchedVpeId = residentVpeId;
+        if (its->findVPEForRedistributor(
+                this,
+                residentVptAddr,
+                matchedVpeId)) {
+            residentVpeId = matchedVpeId;
+        }
+
+        const uint32_t doorbell =
+                        its->clearDefaultDoorbellPending(residentVpeId);
+        if (doorbell != Gicv3::INTID_SPURIOUS) {
+            setClrLPI(doorbell, false);
+        }
+
+        its->syncPendingVirtualLpis(this);
+    }
+
+    /*
+     * Minimal schedule semantics:
+     * replay consumes table-pending state where possible, then Dirty remains
+     * clear until resident direct injection creates unsynchronized LR state.
+     */
+    vLpiPendingLast = vptHasPendingState() || residentLrHasPendingState();
+    vLpiPendingTableDirty = false;
+
+    DPRINTF(GIC, "GICR_VPENDBASER schedule-on cpu=%u"
+                 " vpt=%#llx vpe=%u dirty=%d pendinglast=%d\n",
+            cpuId, (unsigned long long)residentVptAddr, residentVpeId,
+            vLpiPendingTableDirty, vLpiPendingLast);
+}
+
+void
+Gicv3Redistributor::scheduleVpeOff()
+{
+    if (!vLpiPendingTableValid) {
+        return;
+    }
+
+    syncResidentPendingStateToVpt();
+    vLpiPendingLast = vptHasPendingState() || residentLrHasPendingState();
+    vLpiPendingTableDirty = false;
+    vLpiPendingTableValid = false;
+
+    DPRINTF(GIC, "GICR_VPENDBASER schedule-off cpu=%u vpt=%#llx"
+                 " vpe=%u dirty=%d pendinglast=%d\n",
+            cpuId, (unsigned long long)vLpiPendingTablePtr, residentVpeId,
+            vLpiPendingTableDirty, vLpiPendingLast);
+
+    residentVptAddr = 0;
+    residentVpeId = 0xffff;
+}
+
 
 bool
 Gicv3Redistributor::isPendingVLPI(Addr vptAddr, uint32_t vintId)
@@ -1054,6 +1258,15 @@ Gicv3Redistributor::setClrVLPI(Addr vptAddr, uint32_t vintId, bool set)
     }
 
     memProxy->writeBlob(pendingByteAddr, &pendingByte, sizeof(pendingByte));
+
+    if (vptAddr == vLpiPendingTablePtr) {
+        if (set) {
+            vLpiPendingLast = true;
+        } else {
+            vLpiPendingLast =
+                vptHasPendingState() || residentLrHasPendingState();
+        }
+    }
 }
 
 bool
@@ -1070,24 +1283,12 @@ Gicv3Redistributor::injectOrPendVLPI(uint16_t vpeId, uint32_t vintId,
                                      uint32_t doorbellIntid,
                                      Gicv3::GroupId group)
 {
-    (void)doorbellIntid;
     if (vintId < SMALLEST_LPI_ID) {
         return false;
     }
 
     const uint32_t largestVintId = 1u << (std::min<uint8_t>(vptIdBits, 0xf) + 1);
     if (vintId >= largestVintId) {
-        return false;
-    }
-
-    setClrVLPI(vptAddr, vintId, true);
-    const bool resident = isVPEResident(vpeId, vptAddr);
-    DPRINTF(GIC, "injectOrPendVLPI cpu=%u vpe=%u vintid=%u resident=%d vpt=%#llx group=%d\n",
-            cpuId, vpeId, vintId, resident, (unsigned long long)vptAddr, group);
-
-    if (!resident) {
-        DPRINTF(GIC, "injectOrPendVLPI cpu=%u vintid=%u action=pend_nonresident\n",
-                cpuId, vintId);
         return false;
     }
 
@@ -1099,6 +1300,40 @@ Gicv3Redistributor::injectOrPendVLPI(uint16_t vpeId, uint32_t vintId,
                 vLpiConfigurationTablePtr + vintId - SMALLEST_LPI_ID);
         priority = static_cast<uint8_t>(cfg.priority << 2);
         enabled = cfg.enable;
+    }
+
+    const bool wasPending = isPendingVLPI(vptAddr, vintId);
+    setClrVLPI(vptAddr, vintId, true);
+    vLpiPendingLast = true;
+    const bool resident = isVPEResident(vpeId, vptAddr);
+    DPRINTF(GIC, "injectOrPendVLPI cpu=%u vpe=%u vintid=%u"
+                 " resident=%d vpt=%#llx group=%d\n",
+            cpuId, vpeId, vintId,
+            resident, (unsigned long long)vptAddr, group);
+
+    if (!resident) {
+        if (enabled && !wasPending && gic->getIts()) {
+            uint32_t defaultDoorbellIntid = doorbellIntid;
+            if (gic->getIts()->requestDefaultDoorbell(
+                    vpeId, defaultDoorbellIntid)) {
+                /*
+                 * Minimal default doorbell semantics:
+                 * - only default doorbell is modelled
+                 * (no individual doorbells)
+                 * - for non-resident vPE, each residency interval
+                 * is latched to one pending doorbell request at most.
+                 */
+                setClrLPI(defaultDoorbellIntid, true);
+                DPRINTF(GIC, "injectOrPendVLPI cpu=%u vintid=%u"
+                             " action=doorbell intid=%u\n",
+                        cpuId, vintId, defaultDoorbellIntid);
+            }
+        }
+
+        DPRINTF(GIC, "injectOrPendVLPI cpu=%u vintid=%u"
+                     " action=pend_nonresident\n",
+                cpuId, vintId);
+        return false;
     }
 
     if (!enabled) {
@@ -1131,6 +1366,8 @@ Gicv3Redistributor::injectOrPendVLPI(uint16_t vpeId, uint32_t vintId,
         memProxy->writeBlob(pendingByteAddr, &pendingByte,
             sizeof(pendingByte));
     }
+    vLpiPendingTableDirty = true;
+    vLpiPendingLast = true;
     return true;
 }
 
@@ -1271,6 +1508,8 @@ Gicv3Redistributor::serialize(CheckpointOut & cp) const
     SERIALIZE_SCALAR(vLpiIDBits);
     SERIALIZE_SCALAR(vLpiPendingTablePtr);
     SERIALIZE_SCALAR(vLpiPendingTableValid);
+    SERIALIZE_SCALAR(vLpiPendingTableDirty);
+    SERIALIZE_SCALAR(vLpiPendingLast);
     SERIALIZE_SCALAR(residentVpeId);
     SERIALIZE_SCALAR(residentVptAddr);
 }
@@ -1299,6 +1538,8 @@ Gicv3Redistributor::unserialize(CheckpointIn & cp)
     UNSERIALIZE_SCALAR(vLpiIDBits);
     UNSERIALIZE_SCALAR(vLpiPendingTablePtr);
     UNSERIALIZE_SCALAR(vLpiPendingTableValid);
+    UNSERIALIZE_SCALAR(vLpiPendingTableDirty);
+    UNSERIALIZE_SCALAR(vLpiPendingLast);
     UNSERIALIZE_SCALAR(residentVpeId);
     UNSERIALIZE_SCALAR(residentVptAddr);
 }

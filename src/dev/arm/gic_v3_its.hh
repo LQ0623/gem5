@@ -306,6 +306,7 @@ class Gicv3Its : public BasicPioDevice
         Addr vptAddr = 0;
         uint8_t vptIdBits = 0;
         uint32_t doorbellIntid = Gicv3::INTID_SPURIOUS;
+        bool defaultDoorbellPending = false;
     };
 
     struct VirtualIrqEntry
@@ -370,6 +371,8 @@ class Gicv3Its : public BasicPioDevice
     void syncPendingVirtualLpis(Gicv3Redistributor *rd);
     bool findVPEForRedistributor(Gicv3Redistributor *rd, Addr vptAddr,
                                 uint16_t &vpeId) const;
+    bool requestDefaultDoorbell(uint16_t vpeId, uint32_t &doorbellIntid);
+    uint32_t clearDefaultDoorbellPending(uint16_t vpeId);
 
   private:
     std::queue<ItsAction> packetsToRetry;

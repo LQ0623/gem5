@@ -165,6 +165,84 @@ Gicv3Its::findVPEForRedistributor(Gicv3Redistributor *rd, Addr vptAddr,
     return false;
 }
 
+bool
+Gicv3Its::requestDefaultDoorbell(uint16_t vpeId, uint32_t &doorbellIntid)
+{
+    auto *vpe = findVPE(vpeId);
+    if (!vpe || !vpe->valid) {
+        return false;
+    }
+
+    /*
+     * Prefer VMAPP-provided default doorbell; if absent, conservatively
+     * fall back to any valid VMAPTI/VMAPI-provided doorbell for this vPE.
+     * This keeps a minimal but robust model when software programs only the
+     * per-vIRQ path.
+     */
+    uint32_t resolvedDoorbell = vpe->doorbellIntid;
+    if (resolvedDoorbell == Gicv3::INTID_SPURIOUS ||
+        resolvedDoorbell < Gicv3Redistributor::SMALLEST_LPI_ID) {
+        for (const auto &entry : virtualIrqs) {
+            const auto &virt = entry.second;
+            if (!virt.valid || virt.vpeid != vpeId) {
+                continue;
+            }
+            if (virt.doorbellIntid == Gicv3::INTID_SPURIOUS ||
+                virt.doorbellIntid < Gicv3Redistributor::SMALLEST_LPI_ID) {
+                continue;
+            }
+            resolvedDoorbell = virt.doorbellIntid;
+            break;
+        }
+    }
+
+    doorbellIntid = resolvedDoorbell;
+    if (doorbellIntid == Gicv3::INTID_SPURIOUS ||
+        doorbellIntid < Gicv3Redistributor::SMALLEST_LPI_ID) {
+        return false;
+    }
+
+    if (vpe->defaultDoorbellPending) {
+        return false;
+    }
+
+    vpe->defaultDoorbellPending = true;
+    DPRINTF(ITS, "requestDefaultDoorbell vpe=%u doorbell=%u action=arm\n",
+            vpeId, doorbellIntid);
+    return true;
+}
+
+uint32_t
+Gicv3Its::clearDefaultDoorbellPending(uint16_t vpeId)
+{
+    auto *vpe = findVPE(vpeId);
+    if (!vpe || !vpe->valid) {
+        return Gicv3::INTID_SPURIOUS;
+    }
+
+    vpe->defaultDoorbellPending = false;
+    uint32_t resolvedDoorbell = vpe->doorbellIntid;
+    if (resolvedDoorbell == Gicv3::INTID_SPURIOUS ||
+        resolvedDoorbell < Gicv3Redistributor::SMALLEST_LPI_ID) {
+        for (const auto &entry : virtualIrqs) {
+            const auto &virt = entry.second;
+            if (!virt.valid || virt.vpeid != vpeId) {
+                continue;
+            }
+            if (virt.doorbellIntid == Gicv3::INTID_SPURIOUS ||
+                virt.doorbellIntid < Gicv3Redistributor::SMALLEST_LPI_ID) {
+                continue;
+            }
+            resolvedDoorbell = virt.doorbellIntid;
+            break;
+        }
+    }
+
+    DPRINTF(ITS, "clearDefaultDoorbellPending vpe=%u doorbell=%u\n",
+            vpeId, resolvedDoorbell);
+    return resolvedDoorbell;
+}
+
 ItsProcess::ItsProcess(Gicv3Its &_its)
   : its(_its), coroutine(nullptr)
 {
@@ -938,6 +1016,12 @@ ItsCommand::vmapp(Yield &yield, CommandEntry &command)
     vpe.vptAddr = command.raw[2] & 0xFFFFFFFFF0000ULL;
     vpe.rdBase = bits(command.raw[3], 50, 16);
     vpe.doorbellIntid = bits(command.raw[3], 31, 0);
+    /*
+     * Minimal default-doorbell semantics:
+     * vmapp defines the default doorbell source for the vPE and starts a
+     * fresh interval state.
+     */
+    vpe.defaultDoorbellPending = false;
 
     if (vpe.valid) {
         its.syncPendingVirtualLpis(its.getRedistributor(vpe.rdBase));
@@ -1329,6 +1413,8 @@ Gicv3Its::serialize(CheckpointOut & cp) const
         paramOut(cp, csprintf("virtualPes_%u_vptAddr", virtualPeIndex), entry.second.vptAddr);
         paramOut(cp, csprintf("virtualPes_%u_vptIdBits", virtualPeIndex), entry.second.vptIdBits);
         paramOut(cp, csprintf("virtualPes_%u_doorbellIntid", virtualPeIndex), entry.second.doorbellIntid);
+        paramOut(cp, csprintf("virtualPes_%u_defaultDoorbellPending",
+                virtualPeIndex), entry.second.defaultDoorbellPending);
         virtualPeIndex++;
     }
     const uint32_t numVirtualIrqs = virtualIrqs.size();
@@ -1366,6 +1452,8 @@ Gicv3Its::unserialize(CheckpointIn & cp)
         paramIn(cp, csprintf("virtualPes_%u_vptAddr", i), vpe.vptAddr);
         paramIn(cp, csprintf("virtualPes_%u_vptIdBits", i), vpe.vptIdBits);
         paramIn(cp, csprintf("virtualPes_%u_doorbellIntid", i), vpe.doorbellIntid);
+        paramIn(cp, csprintf("virtualPes_%u_defaultDoorbellPending", i),
+                vpe.defaultDoorbellPending);
         virtualPes[vpeid] = vpe;
     }
     virtualIrqs.clear();
