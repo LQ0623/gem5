@@ -89,6 +89,7 @@ Gicv3Redistributor::Gicv3Redistributor(Gicv3 * gic, uint32_t cpu_id)
       vLpiPendingLast(false),
       residentVpeId(0xffff),
       residentVptAddr(0),
+      lpiSyncBusyReads(0),
       addrRangeSize(gic->params().gicv4 ? 0x40000 : 0x20000)
 {
 }
@@ -388,6 +389,10 @@ Gicv3Redistributor::read(Addr addr, size_t size, bool is_secure_access)
 
       // Redistributor Synchronize Register
       case GICR_SYNCR:
+        if (lpiSyncBusyReads) {
+            lpiSyncBusyReads--;
+            return 1;
+        }
         return 0;
 
       case GICR_VPROPBASER:
@@ -719,6 +724,12 @@ Gicv3Redistributor::write(Addr addr, uint64_t data, size_t size,
           if (vLpiIDBits > 0xf) {
               vLpiIDBits = 0xf;
           }
+          /*
+           * Minimal cache model:
+           * VPROPBASER update changes backing table, so drop all cached vLPI
+           * config entries and require fresh fetch after explicit sync points.
+           */
+          vLpiConfigCache.clear();
           if (gic->getIts()) {
               gic->getIts()->syncPendingVirtualLpis(this);
           }
@@ -761,12 +772,12 @@ Gicv3Redistributor::write(Addr addr, uint64_t data, size_t size,
       }
 
       case GICR_INVLPIR: { // Redistributor Invalidate LPI Register
-          // Do nothing: no caching supported
+          invalidateVLPIConfigOneImpl(data & 0xffffffff, true);
           break;
       }
 
       case GICR_INVALLR: { // Redistributor Invalidate All Register
-          // Do nothing: no caching supported
+          invalidateVLPIConfigAllImpl(true);
           break;
       }
 
@@ -1053,6 +1064,31 @@ Gicv3Redistributor::vpendbaserReadValue() const
 }
 
 bool
+Gicv3Redistributor::residentLrHasPendingVintid(uint32_t vintId) const
+{
+    if (!vLpiPendingTableValid || residentVptAddr == 0 ||
+        vintId < SMALLEST_LPI_ID) {
+        return false;
+    }
+
+    for (int lrIdx = 0; lrIdx < Gicv3CPUInterface::VIRTUAL_NUM_LIST_REGS;
+         lrIdx++) {
+        const uint64_t lrRaw =
+            cpuInterface->isa->readMiscRegNoEffect(
+                MISCREG_ICH_LR0_EL2 + lrIdx);
+        const uint64_t state = bits(lrRaw, 63, 62);
+        const uint32_t lrVintId = bits(lrRaw, 31, 0);
+        if ((state == Gicv3CPUInterface::ICH_LR_EL2_STATE_PENDING ||
+             state == Gicv3CPUInterface::ICH_LR_EL2_STATE_ACTIVE_PENDING) &&
+            lrVintId == vintId) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool
 Gicv3Redistributor::residentLrHasPendingState() const
 {
     if (!vLpiPendingTableValid || residentVptAddr == 0) {
@@ -1074,6 +1110,73 @@ Gicv3Redistributor::residentLrHasPendingState() const
     }
 
     return false;
+}
+
+Gicv3Redistributor::CachedVLPIConfig
+Gicv3Redistributor::getCachedVLPIConfig(uint32_t vintId)
+{
+    auto cacheIt = vLpiConfigCache.find(vintId);
+    if (cacheIt != vLpiConfigCache.end()) {
+        return cacheIt->second;
+    }
+
+    CachedVLPIConfig cached;
+    cached.enable = true;
+    cached.priority = 0xa0;
+
+    if (vLpiConfigurationTablePtr) {
+        const LPIConfigurationTableEntry cfg =
+            memProxy->read<LPIConfigurationTableEntry>(
+                vLpiConfigurationTablePtr + vintId - SMALLEST_LPI_ID);
+        cached.priority = static_cast<uint8_t>(cfg.priority << 2);
+        cached.enable = cfg.enable;
+    }
+
+    vLpiConfigCache[vintId] = cached;
+    return cached;
+}
+
+void
+Gicv3Redistributor::invalidateVLPIConfigOneImpl(uint32_t vintId,
+                                                bool pulseSyncBusy)
+{
+    if (vintId >= SMALLEST_LPI_ID) {
+        vLpiConfigCache.erase(vintId);
+    }
+
+    if (pulseSyncBusy) {
+        /*
+         * Minimal GICR_SYNCR.Busy lifecycle:
+         * each invalidate write produces a one-read Busy pulse.
+         */
+        lpiSyncBusyReads = 1;
+    }
+}
+
+void
+Gicv3Redistributor::invalidateVLPIConfigAllImpl(bool pulseSyncBusy)
+{
+    vLpiConfigCache.clear();
+
+    if (pulseSyncBusy) {
+        /*
+         * Minimal GICR_SYNCR.Busy lifecycle:
+         * each invalidate write produces a one-read Busy pulse.
+         */
+        lpiSyncBusyReads = 1;
+    }
+}
+
+void
+Gicv3Redistributor::invalidateVLPIConfigOne(uint32_t vintId)
+{
+    invalidateVLPIConfigOneImpl(vintId, false);
+}
+
+void
+Gicv3Redistributor::invalidateVLPIConfigAll()
+{
+    invalidateVLPIConfigAllImpl(false);
 }
 
 void
@@ -1292,15 +1395,9 @@ Gicv3Redistributor::injectOrPendVLPI(uint16_t vpeId, uint32_t vintId,
         return false;
     }
 
-    uint8_t priority = 0xa0;
-    bool enabled = true;
-    if (vLpiConfigurationTablePtr) {
-        const LPIConfigurationTableEntry cfg =
-            memProxy->read<LPIConfigurationTableEntry>(
-                vLpiConfigurationTablePtr + vintId - SMALLEST_LPI_ID);
-        priority = static_cast<uint8_t>(cfg.priority << 2);
-        enabled = cfg.enable;
-    }
+    const CachedVLPIConfig cachedCfg = getCachedVLPIConfig(vintId);
+    const uint8_t priority = cachedCfg.priority;
+    const bool enabled = cachedCfg.enable;
 
     const bool wasPending = isPendingVLPI(vptAddr, vintId);
     setClrVLPI(vptAddr, vintId, true);
@@ -1512,6 +1609,7 @@ Gicv3Redistributor::serialize(CheckpointOut & cp) const
     SERIALIZE_SCALAR(vLpiPendingLast);
     SERIALIZE_SCALAR(residentVpeId);
     SERIALIZE_SCALAR(residentVptAddr);
+    SERIALIZE_SCALAR(lpiSyncBusyReads);
 }
 
 void
@@ -1542,5 +1640,7 @@ Gicv3Redistributor::unserialize(CheckpointIn & cp)
     UNSERIALIZE_SCALAR(vLpiPendingLast);
     UNSERIALIZE_SCALAR(residentVpeId);
     UNSERIALIZE_SCALAR(residentVptAddr);
+    UNSERIALIZE_SCALAR(lpiSyncBusyReads);
+    vLpiConfigCache.clear();
 }
 } // namespace gem5

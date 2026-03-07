@@ -41,6 +41,8 @@
 #ifndef __DEV_ARM_GICV3_REDISTRIBUTOR_H__
 #define __DEV_ARM_GICV3_REDISTRIBUTOR_H__
 
+#include <unordered_map>
+
 #include "base/addr_range.hh"
 #include "dev/arm/gic_v3.hh"
 #include "sim/serialize.hh"
@@ -51,6 +53,7 @@ namespace gem5
 class Gicv3CPUInterface;
 class Gicv3Distributor;
 class Gicv3Its;
+class ItsCommand;
 
 class Gicv3Redistributor : public Serializable
 {
@@ -59,6 +62,7 @@ class Gicv3Redistributor : public Serializable
     friend class Gicv3CPUInterface;
     friend class Gicv3Distributor;
     friend class Gicv3Its;
+    friend class ItsCommand;
 
   protected:
 
@@ -194,17 +198,29 @@ class Gicv3Redistributor : public Serializable
     bool vLpiPendingLast;
     uint16_t residentVpeId;
     Addr residentVptAddr;
+    uint8_t lpiSyncBusyReads;
+
+    struct CachedVLPIConfig
+    {
+        bool enable = true;
+        uint8_t priority = 0xa0;
+    };
+    std::unordered_map<uint32_t, CachedVLPIConfig> vLpiConfigCache;
 
     static constexpr uint64_t GICR_VPENDBASER_DIRTY = 1ULL << 60;
     static constexpr uint64_t GICR_VPENDBASER_PENDING_LAST = 1ULL << 61;
     static constexpr uint64_t GICR_VPENDBASER_VALID = 1ULL << 63;
 
+    bool residentLrHasPendingVintid(uint32_t vintId) const;
     bool residentLrHasPendingState() const;
     void syncResidentPendingStateToVpt();
     bool vptHasPendingState() const;
     uint64_t vpendbaserReadValue() const;
     void scheduleVpeOn(uint64_t data);
     void scheduleVpeOff();
+    CachedVLPIConfig getCachedVLPIConfig(uint32_t vintId);
+    void invalidateVLPIConfigOneImpl(uint32_t vintId, bool pulseSyncBusy);
+    void invalidateVLPIConfigAllImpl(bool pulseSyncBusy);
 
     BitUnion8(LPIConfigurationTableEntry)
         Bitfield<7, 2> priority;
@@ -273,6 +289,8 @@ class Gicv3Redistributor : public Serializable
     void setClrVLPI(Addr vptAddr, uint32_t vintId, bool set);
     bool isVPEResident(uint16_t vpeId, Addr vptAddr) const;
     void syncPendingVLPI(uint16_t vpeId, Addr vptAddr, uint8_t vptIdBits);
+    void invalidateVLPIConfigOne(uint32_t vintId);
+    void invalidateVLPIConfigAll();
     void sendSGI(uint32_t int_id, Gicv3::GroupId group, bool ns);
     void serialize(CheckpointOut & cp) const override;
     void unserialize(CheckpointIn & cp) override;

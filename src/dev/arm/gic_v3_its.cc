@@ -968,7 +968,27 @@ ItsCommand::sync(Yield &yield, CommandEntry &command)
 void
 ItsCommand::vinvall(Yield &yield, CommandEntry &command)
 {
-    // No virtual LPI cache is modelled yet, so this is a legal no-op.
+    const uint16_t vpeId = bits(command.raw[2], 15, 0);
+    if (its.vpeOutOfRange(vpeId)) {
+        warn("ITS VINVALL rejected: vPEID %u out of range (max %u)\n",
+             vpeId, Gicv3Its::MAX_VPEID);
+        its.incrementReadPointer();
+        terminate(yield);
+    }
+
+    auto *vpe = its.findVPE(vpeId);
+    if (!vpe || !vpe->valid) {
+        warn("ITS VINVALL rejected: vPEID %u not mapped\n", vpeId);
+        its.incrementReadPointer();
+        terminate(yield);
+    }
+
+    /*
+     * Minimal virtual invalidation model:
+     * - invalidate cached vLPI config view on the target redistributor
+     * - no additional asynchronous cache hierarchy is modelled.
+     */
+    its.getRedistributor(vpe->rdBase)->invalidateVLPIConfigAll();
 }
 
 void
@@ -981,6 +1001,12 @@ ItsCommand::vmapi(Yield &yield, CommandEntry &command)
 
     DTE dte = readDeviceTable(yield, command.deviceId);
     const uint16_t vpeId = bits(command.raw[2], 15, 0);
+    if (its.vpeOutOfRange(vpeId)) {
+        warn("ITS VMAPI rejected: vPEID %u out of range (max %u)\n",
+             vpeId, Gicv3Its::MAX_VPEID);
+        its.incrementReadPointer();
+        terminate(yield);
+    }
     const auto *vpe = its.findVPE(vpeId);
     if (!dte.valid || idOutOfRange(command, dte) || !vpe || !vpe->valid) {
         its.incrementReadPointer();
@@ -1010,6 +1036,13 @@ void
 ItsCommand::vmapp(Yield &yield, CommandEntry &command)
 {
     const uint16_t vpeId = bits(command.raw[1], 15, 0);
+    if (its.vpeOutOfRange(vpeId)) {
+        warn("ITS VMAPP rejected: vPEID %u out of range (max %u)\n",
+             vpeId, Gicv3Its::MAX_VPEID);
+        its.incrementReadPointer();
+        terminate(yield);
+    }
+
     Gicv3Its::VirtualPE &vpe = its.virtualPes[vpeId];
     vpe.valid = bits(command.raw[2], 63);
     vpe.vptIdBits = bits(command.raw[2], 59, 53);
@@ -1038,6 +1071,12 @@ ItsCommand::vmapti(Yield &yield, CommandEntry &command)
 
     DTE dte = readDeviceTable(yield, command.deviceId);
     const uint16_t vpeId = bits(command.raw[2], 15, 0);
+    if (its.vpeOutOfRange(vpeId)) {
+        warn("ITS VMAPTI rejected: vPEID %u out of range (max %u)\n",
+             vpeId, Gicv3Its::MAX_VPEID);
+        its.incrementReadPointer();
+        terminate(yield);
+    }
     const auto *vpe = its.findVPE(vpeId);
     const uint32_t vintid = bits(command.raw[1], 63, 32);
     if (!dte.valid || idOutOfRange(command, dte) || !vpe || !vpe->valid) {
@@ -1085,6 +1124,13 @@ ItsCommand::vmovi(Yield &yield, CommandEntry &command)
 
     auto *virt = its.findVirtualIrq(command.deviceId, command.eventId);
     const uint16_t newVpeId = bits(command.raw[2], 15, 0);
+    if (its.vpeOutOfRange(newVpeId)) {
+        warn("ITS VMOVI rejected: vPEID %u out of range (max %u)\n",
+             newVpeId, Gicv3Its::MAX_VPEID);
+        its.incrementReadPointer();
+        terminate(yield);
+    }
+
     const auto *oldVpe = virt ? its.findVPE(virt->vpeid) : nullptr;
     const auto *newVpe = its.findVPE(newVpeId);
     if (!virt || !virt->valid || !newVpe || !newVpe->valid) {
@@ -1092,14 +1138,29 @@ ItsCommand::vmovi(Yield &yield, CommandEntry &command)
         terminate(yield);
     }
 
-    if (oldVpe && oldVpe->valid && oldVpe->vptAddr != newVpe->vptAddr) {
-        auto *redist = its.getRedistributor(oldVpe->rdBase);
-        if (redist->isPendingVLPI(oldVpe->vptAddr, virt->vintid)) {
-            redist->setClrVLPI(oldVpe->vptAddr, virt->vintid, false);
-            its.getRedistributor(newVpe->rdBase)->setClrVLPI(newVpe->vptAddr,
-                                                             virt->vintid,
-                                                             true);
+    bool hadPending = false;
+    if (oldVpe && oldVpe->valid) {
+        auto *oldRedist = its.getRedistributor(oldVpe->rdBase);
+        hadPending = oldRedist->isPendingVLPI(oldVpe->vptAddr, virt->vintid);
+
+        /*
+         * If source vPE is resident, move its LR pending component to table
+         * first so VMOVI does not drop in-flight virtual pending state.
+         */
+        if (oldRedist->isVPEResident(virt->vpeid, oldVpe->vptAddr) &&
+            oldRedist->residentLrHasPendingVintid(virt->vintid)) {
+            oldRedist->setClrVLPI(oldVpe->vptAddr, virt->vintid, true);
+            hadPending = true;
         }
+
+        if (hadPending) {
+            oldRedist->setClrVLPI(oldVpe->vptAddr, virt->vintid, false);
+        }
+    }
+
+    if (hadPending) {
+        its.getRedistributor(newVpe->rdBase)->setClrVLPI(
+            newVpe->vptAddr, virt->vintid, true);
     }
 
     virt->vpeid = newVpeId;
@@ -1112,9 +1173,26 @@ void
 ItsCommand::vmovp(Yield &yield, CommandEntry &command)
 {
     const uint16_t vpeId = bits(command.raw[1], 15, 0);
+    if (its.vpeOutOfRange(vpeId)) {
+        warn("ITS VMOVP rejected: vPEID %u out of range (max %u)\n",
+             vpeId, Gicv3Its::MAX_VPEID);
+        its.incrementReadPointer();
+        terminate(yield);
+    }
+
     auto *vpe = its.findVPE(vpeId);
     if (!vpe || !vpe->valid) {
+        warn("ITS VMOVP rejected: vPEID %u not mapped\n", vpeId);
+        its.incrementReadPointer();
+        terminate(yield);
         return;
+    }
+
+    auto *oldRedist = its.getRedistributor(vpe->rdBase);
+    if (oldRedist->isVPEResident(vpeId, vpe->vptAddr)) {
+        warn("ITS VMOVP rejected: resident vPE %u cannot migrate\n", vpeId);
+        its.incrementReadPointer();
+        terminate(yield);
     }
 
     vpe->rdBase = bits(command.raw[2], 50, 16);
@@ -1124,7 +1202,27 @@ ItsCommand::vmovp(Yield &yield, CommandEntry &command)
 void
 ItsCommand::vsync(Yield &yield, CommandEntry &command)
 {
-    // No asynchronous virtual-cache maintenance is modelled yet.
+    const uint16_t vpeId = bits(command.raw[1], 15, 0);
+    if (its.vpeOutOfRange(vpeId)) {
+        warn("ITS VSYNC rejected: vPEID %u out of range (max %u)\n",
+             vpeId, Gicv3Its::MAX_VPEID);
+        its.incrementReadPointer();
+        terminate(yield);
+    }
+
+    auto *vpe = its.findVPE(vpeId);
+    if (!vpe || !vpe->valid) {
+        warn("ITS VSYNC rejected: vPEID %u not mapped\n", vpeId);
+        its.incrementReadPointer();
+        terminate(yield);
+    }
+
+    /*
+     * Minimal virtual synchronization model:
+     * VSYNC forces visibility of updated vLPI properties by dropping cached
+     * config state for the target vPE's redistributor.
+     */
+    its.getRedistributor(vpe->rdBase)->invalidateVLPIConfigAll();
 }
 
 Gicv3Its::Gicv3Its(const Gicv3ItsParams &params)
@@ -1157,13 +1255,6 @@ Gicv3Its::setGIC(Gicv3 *_gic)
 {
     assert(!gic);
     gic = _gic;
-    /*
-     * Enable virtual-ITS capability bits.
-     * This model uses command-path checks for feature behavior; exposing
-     * these typer bits keeps guest expectations aligned for vLPI tests.
-     */
-    gitsTyper._virtual = 1;
-    gitsTyper.vmovp = 1;
 }
 
 AddrRangeList
@@ -1380,6 +1471,12 @@ Gicv3Its::lpiOutOfRange(uint32_t intid) const
     return intid >= (1ULL << (Gicv3Distributor::IDBITS + 1)) ||
            (intid < Gicv3Redistributor::SMALLEST_LPI_ID &&
             intid != Gicv3::INTID_SPURIOUS);
+}
+
+bool
+Gicv3Its::vpeOutOfRange(uint32_t vpeId) const
+{
+    return vpeId > MAX_VPEID;
 }
 
 DrainState

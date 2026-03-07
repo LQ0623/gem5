@@ -47,6 +47,7 @@
 #include "debug/GIC.hh"
 #include "dev/arm/gic_v3.hh"
 #include "dev/arm/gic_v3_cpu_interface.hh"
+#include "dev/arm/gic_v3_its.hh"
 #include "dev/arm/gic_v3_redistributor.hh"
 
 namespace gem5
@@ -135,6 +136,13 @@ Gicv3Distributor::Gicv3Distributor(Gicv3 * gic, uint32_t it_lines)
         (dvis << 18) | (1 << 17) | (1 << 16) |
         ((have_security ? 1 : 0) << 10) |
         (it_lines_number << 0);
+    gicdTyper2 = 0;
+    if (gic->params().gicv4) {
+        gicdTyper2 |= GICD_TYPER2_VIL;
+        gicdTyper2 |=
+            (Gicv3Its::VPEID_BITS_MINUS_ONE << GICD_TYPER2_VID_SHIFT) &
+            GICD_TYPER2_VID_MASK;
+    }
 
     if (have_security) {
         DS = false;
@@ -500,7 +508,7 @@ Gicv3Distributor::read(Addr addr, size_t size, bool is_secure_access)
         return 0;
 
       case GICD_TYPER2: // Interrupt Controller Type Register 2
-        return 0; // RES0
+        return gicdTyper2;
 
       case GICD_STATUSR: // Error Reporting Status Register
         // Optional register, RAZ/WI
@@ -539,7 +547,7 @@ Gicv3Distributor::write(Addr addr, uint64_t data, size_t size,
     if(Log_observation)
         DPRINTF(GIC, "GICD MMIO write addr=%#lx data=%#lx size=%u\n",
                     addr, data, size);
-    
+
     if (GICD_IGROUPR.contains(addr)) { // Interrupt Group Registers
         if (!DS && !is_secure_access) {
             // RAZ/WI for non-secure accesses
@@ -1166,8 +1174,8 @@ Gicv3Distributor::route(uint32_t int_id)
                         i, int_group,
                         rd->canBeSelectedFor1toNInterrupt(int_group),
                         ci ? ci->isBusy(int_group) : -1);
-                
-                if(ci && ci->isBusy(int_group)) continue;
+
+                if (ci && ci->isBusy(int_group)) continue;
 
                 if (!rd || !rd->canBeSelectedFor1toNInterrupt(int_group)) continue;
 
@@ -1277,7 +1285,7 @@ Gicv3Distributor::update()
     updateCalls++;
 
     DPRINTF(GIC, "DIST update() begin\n");
-    
+
     if (gic->blockIntUpdate())
         return;
 

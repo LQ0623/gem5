@@ -266,6 +266,10 @@ class Gicv3Its : public BasicPioDevice
      * GICD_TYPER.IDbits or not in the LPI range and is not 1023
      */
     bool lpiOutOfRange(uint32_t intid) const;
+    bool vpeOutOfRange(uint32_t vpeId) const;
+    static constexpr uint8_t VPEID_BITS_MINUS_ONE = 13;
+    static constexpr uint16_t MAX_VPEID =
+        (1u << (VPEID_BITS_MINUS_ONE + 1)) - 1;
 
   private: // Command
     uint64_t maxCommands() const;

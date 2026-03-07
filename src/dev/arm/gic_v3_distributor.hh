@@ -171,6 +171,17 @@ class Gicv3Distributor : public Serializable
     uint32_t gicdPidr2;
     uint32_t gicdPidr3;
     uint32_t gicdPidr4;
+    uint32_t gicdTyper2;
+
+    /*
+     * Minimal GICD_TYPER2 reporting used by this model:
+     * - VIL: virtual LPIs implemented
+     * - VID: implemented vPEID width minus one
+     */
+    static const uint32_t GICD_TYPER2_VIL = 1u << 0;
+    static const uint32_t GICD_TYPER2_VID_SHIFT = 4;
+    static const uint32_t GICD_TYPER2_VID_MASK =
+                                                0x1fu << GICD_TYPER2_VID_SHIFT;
 
   public:
 
