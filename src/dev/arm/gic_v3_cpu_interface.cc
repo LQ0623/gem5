@@ -89,6 +89,15 @@ bool
 Gicv3CPUInterface::injectVirtualLPI(uint32_t intid, uint8_t priority,
                                     Gicv3::GroupId group)
 {
+    /*
+     * vLPI 注入到 LR 的最小语义：
+     * 1) 若已有同一 vINTID 且处于 ACTIVE，则升级为 ACTIVE_PENDING；
+     * 2) 若已有同一 vINTID 且已携带 pending 分量，则复用原 LR；
+     * 3) 否则分配空 LR。
+     *
+     * 这样可以保证 duplicate vINTID 到达时不丢第二次到达事件，
+     * 与 tc3 的 ACTIVE->ACTIVE_PENDING 语义一致。
+     */
     const uint8_t encodedPrio = priority & 0xf8;
     int freeIdx = -1;
 
@@ -146,6 +155,7 @@ Gicv3CPUInterface::injectVirtualLPI(uint32_t intid, uint8_t priority,
 bool
 Gicv3CPUInterface::clearPendingVirtualLPI(uint32_t intid)
 {
+    // 给 CLEAR/DISCARD 使用：只清 pending 分量，不破坏 ACTIVE 语义。
     bool cleared = false;
 
     for (int lrIdx = 0; lrIdx < VIRTUAL_NUM_LIST_REGS; lrIdx++) {
@@ -1026,6 +1036,7 @@ Gicv3CPUInterface::setMiscReg(int misc_reg, RegVal val)
 
               if (lr_group == Gicv3::G1NS && lr_group_prio == drop_prio) {
                   if (!virtualIsEOISplitMode()) {
+                      // 非 split 模式下，EOI 直接导致 deactivate。
                       virtualDeactivateIRQ(lr_idx);
                   }
               }
@@ -1138,6 +1149,7 @@ Gicv3CPUInterface::setMiscReg(int misc_reg, RegVal val)
               // No matching LR found
               virtualIncrementEOICount();
           } else {
+              // split 模式下由 DIR 触发真正 deactivate。
               virtualDeactivateIRQ(lr_idx);
           }
 
@@ -2023,6 +2035,7 @@ Gicv3CPUInterface::virtualDeactivateIRQ(int lr_idx)
     isa->setMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx, ich_lr_el2);
 
     if (gic->getIts()) {
+        // 释放 ACTIVE 后立刻触发一次 replay 机会，消费可能堆积的 pending。
         gic->getIts()->syncPendingVirtualLpis(redistributor);
     }
 }

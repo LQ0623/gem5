@@ -193,15 +193,22 @@ class Gicv3Redistributor : public Serializable
     Addr vLpiConfigurationTablePtr;
     uint8_t vLpiIDBits;
     Addr vLpiPendingTablePtr;
+    // VPENDBASER.Valid 对应的调度状态：1=resident，0=non-resident。
     bool vLpiPendingTableValid;
+    // 最小 Dirty 语义：resident 直注入产生了“LR 与表不同步”的窗口。
     bool vLpiPendingTableDirty;
+    // 最小 PendingLast 语义：记录“当前或最近一次调度区间是否见过 pending”。
     bool vLpiPendingLast;
+    // 当前 resident vPE 身份（由 VPENDBASER/ITS 共同解析）。
     uint16_t residentVpeId;
+    // 当前 resident vPE 的 vPT 基地址。
     Addr residentVptAddr;
+    // GICR_SYNCR.Busy 的最小实现：按读次数脉冲。
     uint8_t lpiSyncBusyReads;
 
     struct CachedVLPIConfig
     {
+        // vLPI 配置缓存（enable/priority），用于实现“显式失效后生效”语义。
         bool enable = true;
         uint8_t priority = 0xa0;
     };
@@ -216,6 +223,7 @@ class Gicv3Redistributor : public Serializable
     void syncResidentPendingStateToVpt();
     bool vptHasPendingState() const;
     uint64_t vpendbaserReadValue() const;
+    // VPENDBASER 状态机：Valid 0->1 / 1->0 的最小 schedule/deschedule 语义。
     void scheduleVpeOn(uint64_t data);
     void scheduleVpeOff();
     CachedVLPIConfig getCachedVLPIConfig(uint32_t vintId);

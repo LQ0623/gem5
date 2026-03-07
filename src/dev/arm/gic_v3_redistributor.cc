@@ -389,6 +389,7 @@ Gicv3Redistributor::read(Addr addr, size_t size, bool is_secure_access)
 
       // Redistributor Synchronize Register
       case GICR_SYNCR:
+        // 最小 Busy 生命周期：失效命令后返回一次 Busy=1，再恢复 0。
         if (lpiSyncBusyReads) {
             lpiSyncBusyReads--;
             return 1;
@@ -745,6 +746,10 @@ Gicv3Redistributor::write(Addr addr, uint64_t data, size_t size,
                 ~GICR_VPENDBASER_VALID;
             const uint64_t newNonValid = data & ~GICR_VPENDBASER_VALID;
             if (oldNonValid != newNonValid) {
+                /*
+                 * 架构上 Valid=1 时修改其余字段受限。
+                 * 当前实现采用“warn + ignore”，避免 silent state corruption。
+                 */
                 warn("GICR_VPENDBASER cpu=%u write while Valid=1 "
                      "changed non-Valid fields; ignored\n", cpuId);
             }
@@ -772,11 +777,13 @@ Gicv3Redistributor::write(Addr addr, uint64_t data, size_t size,
       }
 
       case GICR_INVLPIR: { // Redistributor Invalidate LPI Register
+          // 对单个 vINTID 失效，并触发 SYNCR Busy 脉冲。
           invalidateVLPIConfigOneImpl(data & 0xffffffff, true);
           break;
       }
 
       case GICR_INVALLR: { // Redistributor Invalidate All Register
+          // 全量失效，并触发 SYNCR Busy 脉冲。
           invalidateVLPIConfigAllImpl(true);
           break;
       }
@@ -1050,6 +1057,7 @@ Gicv3Redistributor::setClrLPI(uint64_t data, bool set)
 uint64_t
 Gicv3Redistributor::vpendbaserReadValue() const
 {
+    // 把内部状态回编码为 VPENDBASER，可被测试直接观测。
     uint64_t value = vLpiPendingTablePtr;
     if (vLpiPendingTableDirty) {
         value |= GICR_VPENDBASER_DIRTY;
@@ -1071,6 +1079,7 @@ Gicv3Redistributor::residentLrHasPendingVintid(uint32_t vintId) const
         return false;
     }
 
+    // 扫描 LR，识别“只在 LR 中存在的 pending 分量”。
     for (int lrIdx = 0; lrIdx < Gicv3CPUInterface::VIRTUAL_NUM_LIST_REGS;
          lrIdx++) {
         const uint64_t lrRaw =
@@ -1115,6 +1124,7 @@ Gicv3Redistributor::residentLrHasPendingState() const
 Gicv3Redistributor::CachedVLPIConfig
 Gicv3Redistributor::getCachedVLPIConfig(uint32_t vintId)
 {
+    // 若没有显式失效，同一 vINTID 会复用旧配置（用于建模缓存可见性）。
     auto cacheIt = vLpiConfigCache.find(vintId);
     if (cacheIt != vLpiConfigCache.end()) {
         return cacheIt->second;
@@ -1125,6 +1135,7 @@ Gicv3Redistributor::getCachedVLPIConfig(uint32_t vintId)
     cached.priority = 0xa0;
 
     if (vLpiConfigurationTablePtr) {
+        // 缓存未命中时才从 VPROPBASER 对应内存读取配置。
         const LPIConfigurationTableEntry cfg =
             memProxy->read<LPIConfigurationTableEntry>(
                 vLpiConfigurationTablePtr + vintId - SMALLEST_LPI_ID);
@@ -1146,8 +1157,8 @@ Gicv3Redistributor::invalidateVLPIConfigOneImpl(uint32_t vintId,
 
     if (pulseSyncBusy) {
         /*
-         * Minimal GICR_SYNCR.Busy lifecycle:
-         * each invalidate write produces a one-read Busy pulse.
+         * 最小 GICR_SYNCR.Busy 生命周期：
+         * 每次失效写入产生一次“可被读到”的 Busy=1。
          */
         lpiSyncBusyReads = 1;
     }
@@ -1160,8 +1171,8 @@ Gicv3Redistributor::invalidateVLPIConfigAllImpl(bool pulseSyncBusy)
 
     if (pulseSyncBusy) {
         /*
-         * Minimal GICR_SYNCR.Busy lifecycle:
-         * each invalidate write produces a one-read Busy pulse.
+         * 最小 GICR_SYNCR.Busy 生命周期：
+         * 每次失效写入产生一次“可被读到”的 Busy=1。
          */
         lpiSyncBusyReads = 1;
     }
@@ -1260,6 +1271,7 @@ Gicv3Redistributor::vptHasPendingState() const
 void
 Gicv3Redistributor::scheduleVpeOn(uint64_t data)
 {
+    // Valid:0->1，进入 resident：建立 vPE 身份并触发 replay。
     vLpiPendingTablePtr = data & 0xFFFFFFFFF0000ULL;
     vLpiPendingTableValid = true;
     vLpiPendingTableDirty = false;
@@ -1273,9 +1285,11 @@ Gicv3Redistributor::scheduleVpeOn(uint64_t data)
                 this,
                 residentVptAddr,
                 matchedVpeId)) {
+            // 以 ITS 运行态映射为准修正 vPEID，避免软件编码与运行态不一致。
             residentVpeId = matchedVpeId;
         }
 
+        // 重新 schedule 时清掉上一 non-resident 区间的 default doorbell 闩锁。
         const uint32_t doorbell =
                         its->clearDefaultDoorbellPending(residentVpeId);
         if (doorbell != Gicv3::INTID_SPURIOUS) {
@@ -1286,9 +1300,10 @@ Gicv3Redistributor::scheduleVpeOn(uint64_t data)
     }
 
     /*
-     * Minimal schedule semantics:
-     * replay consumes table-pending state where possible, then Dirty remains
-     * clear until resident direct injection creates unsynchronized LR state.
+     * 最小 schedule 语义：
+     * 1) 先 replay vPT pending；
+     * 2) replay 后 Dirty 清零；
+     * 3) 后续仅当 resident 直注入产生“LR/表临时分离”时再置 Dirty。
      */
     vLpiPendingLast = vptHasPendingState() || residentLrHasPendingState();
     vLpiPendingTableDirty = false;
@@ -1306,6 +1321,7 @@ Gicv3Redistributor::scheduleVpeOff()
         return;
     }
 
+    // Valid:1->0，进入 non-resident：先把 LR 中 pending 分量回写到 vPT。
     syncResidentPendingStateToVpt();
     vLpiPendingLast = vptHasPendingState() || residentLrHasPendingState();
     vLpiPendingTableDirty = false;
@@ -1356,6 +1372,7 @@ Gicv3Redistributor::setClrVLPI(Addr vptAddr, uint32_t vintId, bool set)
     } else {
         pendingByte &= ~bitMask;
         if (clearResidentLr) {
+            // CLEAR/DISCARD 需要同步清理 resident LR，避免“表清了但仍可注入”。
             cpuInterface->clearPendingVirtualLPI(vintId);
         }
     }
@@ -1395,6 +1412,7 @@ Gicv3Redistributor::injectOrPendVLPI(uint16_t vpeId, uint32_t vintId,
         return false;
     }
 
+    // 配置读取走缓存：只有显式失效/同步后才保证看到新属性。
     const CachedVLPIConfig cachedCfg = getCachedVLPIConfig(vintId);
     const uint8_t priority = cachedCfg.priority;
     const bool enabled = cachedCfg.enable;
@@ -1409,16 +1427,15 @@ Gicv3Redistributor::injectOrPendVLPI(uint16_t vpeId, uint32_t vintId,
             resident, (unsigned long long)vptAddr, group);
 
     if (!resident) {
+        // non-resident：不直注入，只保留 pending，并按条件请求 default doorbell。
         if (enabled && !wasPending && gic->getIts()) {
             uint32_t defaultDoorbellIntid = doorbellIntid;
             if (gic->getIts()->requestDefaultDoorbell(
                     vpeId, defaultDoorbellIntid)) {
                 /*
-                 * Minimal default doorbell semantics:
-                 * - only default doorbell is modelled
-                 * (no individual doorbells)
-                 * - for non-resident vPE, each residency interval
-                 * is latched to one pending doorbell request at most.
+                 * 最小 default doorbell 语义：
+                 * - 仅实现 default doorbell（不含 individual doorbell）；
+                 * - non-resident 同一 residency interval 最多触发一次。
                  */
                 setClrLPI(defaultDoorbellIntid, true);
                 DPRINTF(GIC, "injectOrPendVLPI cpu=%u vintid=%u"
@@ -1440,7 +1457,9 @@ Gicv3Redistributor::injectOrPendVLPI(uint16_t vpeId, uint32_t vintId,
     }
 
     if (!cpuInterface->injectVirtualLPI(vintId, priority, group)) {
-        DPRINTF(GIC, "injectOrPendVLPI cpu=%u vintid=%u action=lr_unavailable\n",
+        // LR 满时保留 pending，等待后续 EOI/DIR 或 schedule/replay 消费。
+        DPRINTF(GIC, "injectOrPendVLPI cpu=%u vintid=%u"
+                " action=lr_unavailable\n",
                 cpuId, vintId);
         return false;
     }

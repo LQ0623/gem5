@@ -174,9 +174,12 @@ class Gicv3Distributor : public Serializable
     uint32_t gicdTyper2;
 
     /*
-     * Minimal GICD_TYPER2 reporting used by this model:
-     * - VIL: virtual LPIs implemented
-     * - VID: implemented vPEID width minus one
+     * GICD_TYPER2 的最小上报模型：
+     * - VIL：声明实现了 virtual LPI 能力
+     * - VID：声明实现的 vPEID 位宽减一
+     *
+     * 目的不是覆盖全部 v4.1 能力，而是让软件可“自发现”当前模型边界，
+     * 并与 ITS 命令越界检查使用同一位宽定义，避免能力上报与行为不一致。
      */
     static const uint32_t GICD_TYPER2_VIL = 1u << 0;
     static const uint32_t GICD_TYPER2_VID_SHIFT = 4;

@@ -138,6 +138,7 @@ Gicv3Distributor::Gicv3Distributor(Gicv3 * gic, uint32_t it_lines)
         (it_lines_number << 0);
     gicdTyper2 = 0;
     if (gic->params().gicv4) {
+        // 仅在启用 gicv4 时暴露 vLPI/vPE 相关 capability。
         gicdTyper2 |= GICD_TYPER2_VIL;
         gicdTyper2 |=
             (Gicv3Its::VPEID_BITS_MINUS_ONE << GICD_TYPER2_VID_SHIFT) &

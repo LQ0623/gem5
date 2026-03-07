@@ -356,8 +356,10 @@ class Gicv3CPUInterface : public ArmISA::BaseISADevice, public Serializable
     void assertWakeRequest(void);
     void deassertWakeRequest(void);
 
+    // vLPI direct inject 的 LR 写入口（含 duplicate vINTID 升级语义）。
     bool injectVirtualLPI(uint32_t intid, uint8_t priority,
                           Gicv3::GroupId group = Gicv3::G1NS);
+    // CLEAR/DISCARD 使用的 pending 清理入口（保留 ACTIVE 状态约束）。
     bool clearPendingVirtualLPI(uint32_t intid);
 
     RegVal readBankedMiscReg(ArmISA::MiscRegIndex misc_reg) const;

@@ -266,7 +266,14 @@ class Gicv3Its : public BasicPioDevice
      * GICD_TYPER.IDbits or not in the LPI range and is not 1023
      */
     bool lpiOutOfRange(uint32_t intid) const;
+    /**
+     * vPEID 越界检查（最小错误模型入口）：
+     * 当前实现统一采用“warn + reject”，而不是静默截断。
+     * 这样测试可以稳定观察到错误路径，同时避免把非法 vPEID
+     * 映射到错误对象导致难以定位的问题。
+     */
     bool vpeOutOfRange(uint32_t vpeId) const;
+    // 以最小可验证语义固定 vPEID 宽度：14 bit（VID=13）。
     static constexpr uint8_t VPEID_BITS_MINUS_ONE = 13;
     static constexpr uint16_t MAX_VPEID =
         (1u << (VPEID_BITS_MINUS_ONE + 1)) - 1;
@@ -305,26 +312,39 @@ class Gicv3Its : public BasicPioDevice
 
     struct VirtualPE
     {
+        // VMAPP 产生的 vPE 是否有效。
         bool valid = false;
+        // 该 vPE 当前映射的目标 redistributor（ITS rdBase 编码）。
         uint64_t rdBase = 0;
+        // vPending table 基地址（用于 resident/non-resident pending 同步）。
         Addr vptAddr = 0;
+        // vINTID 宽度上限（来自 VMAPP，约束 replay 范围）。
         uint8_t vptIdBits = 0;
+        // VMAPP 提供的 default doorbell 物理 INTID（1023 表示禁用）。
         uint32_t doorbellIntid = Gicv3::INTID_SPURIOUS;
+        // 同一 non-resident interval 内 doorbell 只触发一次的闩锁位。
         bool defaultDoorbellPending = false;
     };
 
     struct VirtualIrqEntry
     {
+        // (DeviceID, EventID) -> vIRQ 映射是否有效。
         bool valid = false;
+        // 对应虚拟中断号（vINTID）。
         uint32_t vintid = 0;
+        // 该虚拟中断路径携带的 doorbell 信息（最小模型仅用 default）。
         uint32_t doorbellIntid = Gicv3::INTID_SPURIOUS;
+        // 当前绑定的目标 vPE（会被 VMOVI 改写）。
         uint16_t vpeid = 0;
+        // 当前最小实现仅覆盖 G1NS。
         Gicv3::GroupId group = Gicv3::G1NS;
     };
 
     struct TranslatedInt
     {
+        // ITS table walk 结果：physical 路径还是 virtual 路径。
         InterruptType type = PHYSICAL_INTERRUPT;
+        // physical 为 pINTID，virtual 为 vINTID。
         uint32_t intid = 0;
         uint32_t doorbellIntid = Gicv3::INTID_SPURIOUS;
         uint16_t vpeid = 0;
@@ -386,6 +406,7 @@ class Gicv3Its : public BasicPioDevice
 
     bool pendingCommands;
     uint32_t pendingTranslations;
+    // vPE 与 vIRQ 运行态索引：承担 VMAPP/VMAPTI/VMOVI/VMOVP 等命令语义。
     std::unordered_map<uint16_t, VirtualPE> virtualPes;
     std::unordered_map<uint64_t, VirtualIrqEntry> virtualIrqs;
 };

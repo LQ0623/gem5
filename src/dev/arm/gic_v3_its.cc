@@ -65,6 +65,7 @@ const uint32_t Gicv3Its::CTLR_QUIESCENT = 0x80000000;
 uint64_t
 Gicv3Its::virtualIrqKey(uint32_t deviceId, uint32_t eventId) const
 {
+    // 统一键值编码，保证命令路径和翻译路径都用同一索引。
     return (static_cast<uint64_t>(deviceId) << 32) | eventId;
 }
 
@@ -99,6 +100,11 @@ Gicv3Its::findVirtualIrq(uint32_t deviceId, uint32_t eventId) const
 void
 Gicv3Its::syncPendingVirtualLpis(Gicv3Redistributor *rd)
 {
+    /*
+     * 该 helper 是“schedule-on/replay”的核心桥接点：
+     * redistributor 进入 resident 后，通过 ITS 的 vIRQ 映射表扫描
+     * 当前 vPE 的 pending 位并尝试注入，从而把表状态转换回 LR 状态。
+     */
     if (!rd) {
         return;
     }
@@ -203,6 +209,7 @@ Gicv3Its::requestDefaultDoorbell(uint16_t vpeId, uint32_t &doorbellIntid)
     }
 
     if (vpe->defaultDoorbellPending) {
+        // 同一 non-resident residency interval 内只允许一次 doorbell。
         return false;
     }
 
@@ -430,6 +437,12 @@ ItsTranslation::main(Yield &yield)
 
     auto result = translateLPI(yield, device_id, event_id);
 
+    /*
+     * 翻译后统一在这里分流：
+     * - physical: 直接置位 LPI pending
+     * - virtual : 交给 injectOrPendVLPI 决定是 direct inject 还是
+     *   non-resident pending + doorbell
+     */
     if (result.type == Gicv3Its::PHYSICAL_INTERRUPT) {
         result.redistributor->setClrLPI(result.intid, true);
     } else {
@@ -464,6 +477,7 @@ ItsTranslation::translateLPI(Yield &yield, uint32_t device_id,
         itte.vpeid, itte.intNum);
 
     if (itte.intType == Gicv3Its::VIRTUAL_INTERRUPT) {
+        // virtual 路径必须再通过运行态映射校验，避免表项与运行态脱节。
         const auto *virtualIrq = its.findVirtualIrq(device_id, event_id);
         if (!virtualIrq || !virtualIrq->valid) {
             terminate(yield);
@@ -617,8 +631,11 @@ ItsCommand::clear(Yield &yield, CommandEntry &command)
     }
 
     if (itte.intType == Gicv3Its::VIRTUAL_INTERRUPT) {
-        const auto *virtualIrq = its.findVirtualIrq(command.deviceId, command.eventId);
-        const auto *vpe = virtualIrq ? its.findVPE(virtualIrq->vpeid) : nullptr;
+        // CLEAR 在 virtual 路径只清 pending，不删除映射。
+        const auto *virtualIrq =
+                its.findVirtualIrq(command.deviceId, command.eventId);
+        const auto *vpe = virtualIrq ?
+                        its.findVPE(virtualIrq->vpeid) : nullptr;
         if (!virtualIrq || !virtualIrq->valid || !vpe || !vpe->valid) {
             its.incrementReadPointer();
             terminate(yield);
@@ -661,8 +678,11 @@ ItsCommand::discard(Yield &yield, CommandEntry &command)
     }
 
     if (itte.intType == Gicv3Its::VIRTUAL_INTERRUPT) {
-        const auto *virtualIrq = its.findVirtualIrq(command.deviceId, command.eventId);
-        const auto *vpe = virtualIrq ? its.findVPE(virtualIrq->vpeid) : nullptr;
+        // DISCARD 在 virtual 路径既清 pending，也移除映射。
+        const auto *virtualIrq =
+                its.findVirtualIrq(command.deviceId, command.eventId);
+        const auto *vpe = virtualIrq ?
+                        its.findVPE(virtualIrq->vpeid) : nullptr;
         if (virtualIrq && virtualIrq->valid && vpe && vpe->valid) {
             its.getRedistributor(vpe->rdBase)->setClrVLPI(vpe->vptAddr,
                                                           virtualIrq->vintid,
@@ -704,8 +724,11 @@ ItsCommand::doInt(Yield &yield, CommandEntry &command)
     }
 
     if (itte.intType == Gicv3Its::VIRTUAL_INTERRUPT) {
-        const auto *virtualIrq = its.findVirtualIrq(command.deviceId, command.eventId);
-        const auto *vpe = virtualIrq ? its.findVPE(virtualIrq->vpeid) : nullptr;
+        // vLPI direct injection 主入口：后续 resident/non-resident 由 RD 决策。
+        const auto *virtualIrq =
+                its.findVirtualIrq(command.deviceId, command.eventId);
+        const auto *vpe = virtualIrq ?
+                        its.findVPE(virtualIrq->vpeid) : nullptr;
         if (!virtualIrq || !virtualIrq->valid || !vpe || !vpe->valid) {
             its.incrementReadPointer();
             terminate(yield);
@@ -984,9 +1007,9 @@ ItsCommand::vinvall(Yield &yield, CommandEntry &command)
     }
 
     /*
-     * Minimal virtual invalidation model:
-     * - invalidate cached vLPI config view on the target redistributor
-     * - no additional asynchronous cache hierarchy is modelled.
+     * 最小 invalidation 语义：
+     * 仅使目标 RD 的 vLPI 配置缓存失效，不模拟更复杂缓存层级。
+     * 这样能保证“修改属性后需显式失效/同步才生效”的可观测行为。
      */
     its.getRedistributor(vpe->rdBase)->invalidateVLPIConfigAll();
 }
@@ -1022,6 +1045,7 @@ ItsCommand::vmapi(Yield &yield, CommandEntry &command)
     itte.intNumHyp = doorbellIntid & 0x3fff;
     writeIrqTranslationTable(yield, dte.ittAddress, command.eventId, itte);
 
+    // VMAPI 在该最小实现中同时更新 ITTE 与运行态 virtualIrqs。
     Gicv3Its::VirtualIrqEntry virt;
     virt.valid = true;
     // Minimal implementation: virtual LPIs are currently modelled as Group1NS only.
@@ -1050,9 +1074,8 @@ ItsCommand::vmapp(Yield &yield, CommandEntry &command)
     vpe.rdBase = bits(command.raw[3], 50, 16);
     vpe.doorbellIntid = bits(command.raw[3], 31, 0);
     /*
-     * Minimal default-doorbell semantics:
-     * vmapp defines the default doorbell source for the vPE and starts a
-     * fresh interval state.
+     * default doorbell 闩锁在 VMAPP 时清零，表示进入新的 residency 区间。
+     * 若不清零，会导致上一轮 non-resident 的一次性 doorbell 状态泄漏。
      */
     vpe.defaultDoorbellPending = false;
 
@@ -1092,6 +1115,7 @@ ItsCommand::vmapti(Yield &yield, CommandEntry &command)
     itte.intNumHyp = bits(command.raw[3], 13, 0);
     writeIrqTranslationTable(yield, dte.ittAddress, command.eventId, itte);
 
+    // VMAPTI 建立 (DeviceID, EventID) 到 (vINTID, vPE) 的核心映射。
     Gicv3Its::VirtualIrqEntry virt;
     virt.valid = true;
     // Minimal implementation: virtual LPIs are currently modelled as Group1NS only.
@@ -1138,14 +1162,15 @@ ItsCommand::vmovi(Yield &yield, CommandEntry &command)
         terminate(yield);
     }
 
+    // VMOVI 需要迁移“映射 + pending 状态”，否则会出现迁移后丢中断。
     bool hadPending = false;
     if (oldVpe && oldVpe->valid) {
         auto *oldRedist = its.getRedistributor(oldVpe->rdBase);
         hadPending = oldRedist->isPendingVLPI(oldVpe->vptAddr, virt->vintid);
 
         /*
-         * If source vPE is resident, move its LR pending component to table
-         * first so VMOVI does not drop in-flight virtual pending state.
+         * source vPE 若 resident，pending 可能只在 LR 中而不在表里。
+         * 先把 LR pending 分量回写到 vPT，再执行迁移，避免在飞中断丢失。
          */
         if (oldRedist->isVPEResident(virt->vpeid, oldVpe->vptAddr) &&
             oldRedist->residentLrHasPendingVintid(virt->vintid)) {
@@ -1190,6 +1215,7 @@ ItsCommand::vmovp(Yield &yield, CommandEntry &command)
 
     auto *oldRedist = its.getRedistributor(vpe->rdBase);
     if (oldRedist->isVPEResident(vpeId, vpe->vptAddr)) {
+        // 统一策略：resident vPE 不允许 VMOVP，避免与在飞注入语义冲突。
         warn("ITS VMOVP rejected: resident vPE %u cannot migrate\n", vpeId);
         its.incrementReadPointer();
         terminate(yield);
@@ -1218,9 +1244,9 @@ ItsCommand::vsync(Yield &yield, CommandEntry &command)
     }
 
     /*
-     * Minimal virtual synchronization model:
-     * VSYNC forces visibility of updated vLPI properties by dropping cached
-     * config state for the target vPE's redistributor.
+     * 最小 VSYNC 语义：
+     * 强制丢弃目标 RD 的 vLPI 配置缓存，使后续注入读取到新属性。
+     * 与 VINVALL 一起构成“显式同步后生效”的可验证路径。
      */
     its.getRedistributor(vpe->rdBase)->invalidateVLPIConfigAll();
 }
@@ -1476,6 +1502,7 @@ Gicv3Its::lpiOutOfRange(uint32_t intid) const
 bool
 Gicv3Its::vpeOutOfRange(uint32_t vpeId) const
 {
+    // 统一 vPEID 上限判断，供所有虚拟命令共享错误模型。
     return vpeId > MAX_VPEID;
 }
 
