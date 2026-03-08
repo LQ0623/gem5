@@ -1568,6 +1568,16 @@ Gicv3CPUInterface::setMiscReg(int misc_reg, RegVal val)
             ich_hcr_el2.EOIcount = requested_ich_hcr_el2.EOIcount;
         }
 
+        if (requested_ich_hcr_el2.vSGIEOICount >=
+            ich_hcr_el2.vSGIEOICount) {
+            /*
+             * stage-3 minimal model:
+             * vSGIEOICount 与 EOIcount 同样采用“单调可写”语义，
+             * 允许软件清零或对齐快照。
+             */
+            ich_hcr_el2.vSGIEOICount = requested_ich_hcr_el2.vSGIEOICount;
+        }
+
         ich_hcr_el2.TDIR = requested_ich_hcr_el2.TDIR;
         ich_hcr_el2.TSEI = requested_ich_hcr_el2.TSEI;
         ich_hcr_el2.TALL1 = requested_ich_hcr_el2.TALL1;;
@@ -2043,6 +2053,7 @@ Gicv3CPUInterface::virtualDeactivateIRQ(int lr_idx)
 {
     ICH_LR_EL2 ich_lr_el2 = isa->readMiscRegNoEffect(MISCREG_ICH_LR0_EL2 +
             lr_idx);
+    const uint32_t vint_id = ich_lr_el2.vINTID;
 
     if (ich_lr_el2.HW) {
         // Deactivate the associated physical interrupt
@@ -2057,6 +2068,14 @@ Gicv3CPUInterface::virtualDeactivateIRQ(int lr_idx)
         //  Remove the active bit
     ich_lr_el2.State = ich_lr_el2.State & ~ICH_LR_EL2_STATE_ACTIVE;
     isa->setMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx, ich_lr_el2);
+
+    if (vint_id < Gicv3::SGI_MAX) {
+        /*
+         * stage-3 minimal vSGIEOICount:
+         * 仅对 direct-injected vSGI（INTID 0..15）在完成 deactivate 时记账。
+         */
+        virtualIncrementVSGIEOICount();
+    }
 
     if (gic->getIts()) {
         // 释放 ACTIVE 后立刻触发一次 replay 机会，消费可能堆积的 pending。
@@ -2375,6 +2394,17 @@ Gicv3CPUInterface::virtualIncrementEOICount()
     uint32_t EOI_cout = bits(ich_hcr_el2, 31, 27);
     EOI_cout++;
     ich_hcr_el2 = insertBits(ich_hcr_el2, 31, 27, EOI_cout);
+    isa->setMiscRegNoEffect(MISCREG_ICH_HCR_EL2, ich_hcr_el2);
+}
+
+void
+Gicv3CPUInterface::virtualIncrementVSGIEOICount()
+{
+    ICH_HCR_EL2 ich_hcr_el2 = isa->readMiscRegNoEffect(MISCREG_ICH_HCR_EL2);
+    const uint32_t cnt = ich_hcr_el2.vSGIEOICount;
+    if (cnt < 0x1f) {
+        ich_hcr_el2.vSGIEOICount = cnt + 1;
+    }
     isa->setMiscRegNoEffect(MISCREG_ICH_HCR_EL2, ich_hcr_el2);
 }
 

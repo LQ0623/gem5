@@ -210,7 +210,8 @@ class Gicv3CPUInterface : public ArmISA::BaseISADevice, public Serializable
     BitUnion64(ICH_HCR_EL2)
         Bitfield<63, 32> res0_2;
         Bitfield<31, 27> EOIcount;
-        Bitfield<26, 15> res0_1;
+        Bitfield<26, 22> vSGIEOICount;
+        Bitfield<21, 15> res0_1;
         Bitfield<14>     TDIR;
         Bitfield<13>     TSEI;
         Bitfield<12>     TALL1;
@@ -348,6 +349,7 @@ class Gicv3CPUInterface : public ArmISA::BaseISADevice, public Serializable
     uint32_t virtualGroupPriorityMask(Gicv3::GroupId group) const;
     uint8_t virtualHighestActivePriority() const;
     void virtualIncrementEOICount();
+    void virtualIncrementVSGIEOICount();
     bool virtualIsEOISplitMode() const;
     void virtualUpdate();
     RegVal bpr1(Gicv3::GroupId group);

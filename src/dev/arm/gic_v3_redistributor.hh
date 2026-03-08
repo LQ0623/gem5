@@ -169,6 +169,10 @@ class Gicv3Redistributor : public Serializable
         GICR_VPROPBASER = VLPI_base + 0x0070,
         // Redistributor Virtual Pending Table Base Address Register
         GICR_VPENDBASER = VLPI_base + 0x0078,
+        // Virtual SGI Generate Register (stage-3 minimal model).
+        GICR_VSGIR = VLPI_base + 0x0080,
+        // Virtual SGI Pending view register (stage-3 minimal model).
+        GICR_VSGIPENDR = VLPI_base + 0x0088,
     };
 
     std::vector <uint8_t> irqGroup;
@@ -205,6 +209,10 @@ class Gicv3Redistributor : public Serializable
     Addr residentVptAddr;
     // 当前 resident vPE 的 vPT IDbits（用于定位 vSGI state 尾部区域）。
     uint8_t residentVptIdBits;
+    // VPENDBASER 最近一次配置的 vPEID（Valid=0 时也保留，供寄存器视图使用）。
+    uint16_t configuredVpeId;
+    // VPENDBASER 最近一次配置的 vPT IDbits（非 resident 读写 VSGI 寄存器时使用）。
+    uint8_t configuredVptIdBits;
     // GICR_SYNCR.Busy 的最小实现：按读次数脉冲。
     uint8_t lpiSyncBusyReads;
 
@@ -234,6 +242,8 @@ class Gicv3Redistributor : public Serializable
     bool vsgiStateAddr(Addr vptAddr, uint8_t vptIdBits, Addr &stateAddr) const;
     __uint128_t readVsgiStateRaw(Addr stateAddr) const;
     void writeVsgiStateRaw(Addr stateAddr, __uint128_t state);
+    bool resolveCurrentVSGIContext(uint16_t &vpeId, Addr &vptAddr,
+                                   uint8_t &vptIdBits);
     uint16_t readVSGIPendingBitmap(Addr vptAddr, uint8_t vptIdBits) const;
     bool setClrVSGIPending(uint16_t vpeId, Addr vptAddr, uint8_t vptIdBits,
                            uint32_t vintId, bool set, bool clearResidentLr);

@@ -90,6 +90,8 @@ Gicv3Redistributor::Gicv3Redistributor(Gicv3 * gic, uint32_t cpu_id)
       residentVpeId(0xffff),
       residentVptAddr(0),
       residentVptIdBits(0xf),
+      configuredVpeId(0xffff),
+      configuredVptIdBits(0xf),
       lpiSyncBusyReads(0),
       addrRangeSize(gic->params().gicv4 ? 0x40000 : 0x20000)
 {
@@ -420,6 +422,20 @@ Gicv3Redistributor::read(Addr addr, size_t size, bool is_secure_access)
 
       case GICR_VPENDBASER:
         return vpendbaserReadValue();
+
+      case GICR_VSGIPENDR: {
+        /*
+         * 只提供 pending 视图，不维护独立副本。
+         * 真实状态始终在 vPT 尾部 128bit 的 Pending[15:0]。
+         */
+        uint16_t vpeId = 0xffff;
+        Addr vptAddr = 0;
+        uint8_t vptIdBits = 0xf;
+        if (!resolveCurrentVSGIContext(vpeId, vptAddr, vptIdBits)) {
+            return 0;
+        }
+        return readVSGIPendingBitmap(vptAddr, vptIdBits);
+      }
 
       default:
         gic->reserved("Gicv3Redistributor::read(): invalid offset %#x\n", addr);
@@ -792,6 +808,7 @@ Gicv3Redistributor::write(Addr addr, uint64_t data, size_t size,
       case GICR_VPENDBASER: {
         const bool oldValid = vLpiPendingTableValid;
         const bool newValid = bits(data, 63);
+        const uint16_t dataVpeId = bits(data, 15, 0);
 
         if (oldValid && newValid) {
             const uint64_t oldNonValid = vpendbaserReadValue() &
@@ -810,6 +827,18 @@ Gicv3Redistributor::write(Addr addr, uint64_t data, size_t size,
 
         if (oldValid && !newValid) {
             scheduleVpeOff();
+            vLpiPendingTablePtr = data & 0xFFFFFFFFF0000ULL;
+            configuredVpeId = dataVpeId;
+            if (gic->getIts()) {
+                uint16_t matchedVpeId = configuredVpeId;
+                uint8_t matchedVptIdBits = configuredVptIdBits;
+                if (gic->getIts()->findVPEForRedistributor(
+                        this, vLpiPendingTablePtr, matchedVpeId,
+                        &matchedVptIdBits)) {
+                    configuredVpeId = matchedVpeId;
+                    configuredVptIdBits = matchedVptIdBits;
+                }
+            }
             break;
         }
 
@@ -823,10 +852,44 @@ Gicv3Redistributor::write(Addr addr, uint64_t data, size_t size,
          * Software may prepare a future schedule-on value while idle.
          */
         vLpiPendingTablePtr = data & 0xFFFFFFFFF0000ULL;
+        configuredVpeId = dataVpeId;
+        configuredVptIdBits = 0xf;
+        if (gic->getIts()) {
+            uint16_t matchedVpeId = configuredVpeId;
+            uint8_t matchedVptIdBits = configuredVptIdBits;
+            if (gic->getIts()->findVPEForRedistributor(
+                    this, vLpiPendingTablePtr, matchedVpeId,
+                    &matchedVptIdBits)) {
+                configuredVpeId = matchedVpeId;
+                configuredVptIdBits = matchedVptIdBits;
+            }
+        }
         residentVptAddr = 0;
         residentVpeId = 0xffff;
         residentVptIdBits = 0xf;
         break;
+      }
+
+      case GICR_VSGIR: {
+          const uint32_t vintId = data & 0xfU;
+          if (vintId >= Gicv3::SGI_MAX) {
+              warn("GICR_VSGIR cpu=%u ignored: vINTID %u out of range\n",
+                   cpuId, vintId);
+              break;
+          }
+
+          uint16_t vpeId = 0xffff;
+          Addr vptAddr = 0;
+          uint8_t vptIdBits = 0xf;
+          if (!resolveCurrentVSGIContext(vpeId, vptAddr, vptIdBits)) {
+              warn("GICR_VSGIR cpu=%u ignored: no valid vPE/vPT context\n",
+                   cpuId);
+              break;
+          }
+
+          // 与 GITS_SGIR 共享同一注入/置 pending helper。
+          injectOrPendVSGI(vpeId, vptAddr, vptIdBits, vintId);
+          break;
       }
 
       case GICR_INVLPIR: { // Redistributor Invalidate LPI Register
@@ -1288,6 +1351,54 @@ Gicv3Redistributor::writeVsgiStateRaw(Addr stateAddr, __uint128_t state)
     memProxy->writeBlob(stateAddr + sizeof(low), &high, sizeof(high));
 }
 
+bool
+Gicv3Redistributor::resolveCurrentVSGIContext(uint16_t &vpeId, Addr &vptAddr,
+                                              uint8_t &vptIdBits)
+{
+    /*
+     * VSGIR/VSGIPENDR 的“当前上下文”规则（最小模型）：
+     * 1) Valid=1 时使用 resident vPE；
+     * 2) Valid=0 时使用 VPENDBASER 最近一次配置的 vPE/vPT；
+     * 3) IDbits 优先用缓存，不足时向 ITS 查询修正。
+     */
+    if (vLpiPendingTableValid) {
+        vpeId = residentVpeId;
+        vptAddr = residentVptAddr;
+        vptIdBits = residentVptIdBits;
+    } else {
+        vpeId = configuredVpeId;
+        vptAddr = vLpiPendingTablePtr;
+        vptIdBits = configuredVptIdBits;
+    }
+
+    if (vpeId == 0xffff || vptAddr == 0) {
+        return false;
+    }
+
+    auto *its = gic->getIts();
+    if (its) {
+        uint16_t matchedVpeId = vpeId;
+        uint8_t matchedVptIdBits = vptIdBits;
+        if (its->findVPEForRedistributor(
+                this, vptAddr, matchedVpeId, &matchedVptIdBits)) {
+            vpeId = matchedVpeId;
+            vptIdBits = matchedVptIdBits;
+            configuredVpeId = matchedVpeId;
+            configuredVptIdBits = matchedVptIdBits;
+            if (vLpiPendingTableValid) {
+                residentVpeId = matchedVpeId;
+                residentVptIdBits = matchedVptIdBits;
+            }
+        }
+    }
+
+    if (vptIdBits > 0xf) {
+        vptIdBits = 0xf;
+    }
+
+    return true;
+}
+
 uint16_t
 Gicv3Redistributor::readVSGIPendingBitmap(Addr vptAddr,
                                           uint8_t vptIdBits) const
@@ -1568,6 +1679,8 @@ Gicv3Redistributor::scheduleVpeOn(uint64_t data)
     residentVptAddr = vLpiPendingTablePtr;
     residentVpeId = bits(data, 15, 0);
     residentVptIdBits = 0xf;
+    configuredVpeId = residentVpeId;
+    configuredVptIdBits = residentVptIdBits;
 
     auto *its = gic->getIts();
     if (its) {
@@ -1581,6 +1694,8 @@ Gicv3Redistributor::scheduleVpeOn(uint64_t data)
             // 以 ITS 运行态映射为准修正 vPEID，避免软件编码与运行态不一致。
             residentVpeId = matchedVpeId;
             residentVptIdBits = matchedVptIdBits;
+            configuredVpeId = matchedVpeId;
+            configuredVptIdBits = matchedVptIdBits;
         }
 
         // 重新 schedule 时清掉上一 non-resident 区间的 default doorbell 闩锁。
@@ -1629,6 +1744,8 @@ Gicv3Redistributor::scheduleVpeOff()
             cpuId, (unsigned long long)vLpiPendingTablePtr, residentVpeId,
             vLpiPendingTableDirty, vLpiPendingLast);
 
+    configuredVpeId = residentVpeId;
+    configuredVptIdBits = residentVptIdBits;
     residentVptAddr = 0;
     residentVpeId = 0xffff;
     residentVptIdBits = 0xf;
@@ -1927,6 +2044,8 @@ Gicv3Redistributor::serialize(CheckpointOut & cp) const
     SERIALIZE_SCALAR(residentVpeId);
     SERIALIZE_SCALAR(residentVptAddr);
     SERIALIZE_SCALAR(residentVptIdBits);
+    SERIALIZE_SCALAR(configuredVpeId);
+    SERIALIZE_SCALAR(configuredVptIdBits);
     SERIALIZE_SCALAR(lpiSyncBusyReads);
 }
 
@@ -1959,6 +2078,8 @@ Gicv3Redistributor::unserialize(CheckpointIn & cp)
     UNSERIALIZE_SCALAR(residentVpeId);
     UNSERIALIZE_SCALAR(residentVptAddr);
     UNSERIALIZE_SCALAR(residentVptIdBits);
+    UNSERIALIZE_SCALAR(configuredVpeId);
+    UNSERIALIZE_SCALAR(configuredVptIdBits);
     UNSERIALIZE_SCALAR(lpiSyncBusyReads);
     vLpiConfigCache.clear();
 }
