@@ -229,6 +229,9 @@ class Gicv3Redistributor : public Serializable
     CachedVLPIConfig getCachedVLPIConfig(uint32_t vintId);
     void invalidateVLPIConfigOneImpl(uint32_t vintId, bool pulseSyncBusy);
     void invalidateVLPIConfigAllImpl(bool pulseSyncBusy);
+    bool vsgiStateAddr(Addr vptAddr, uint8_t vptIdBits, Addr &stateAddr) const;
+    __uint128_t readVsgiStateRaw(Addr stateAddr) const;
+    void writeVsgiStateRaw(Addr stateAddr, __uint128_t state);
 
     BitUnion8(LPIConfigurationTableEntry)
         Bitfield<7, 2> priority;
@@ -293,6 +296,12 @@ class Gicv3Redistributor : public Serializable
                           Addr vptAddr, uint8_t vptIdBits,
                           uint32_t doorbellIntid,
                           Gicv3::GroupId group);
+    bool configureVirtualSGI(uint16_t vpeId, Addr vptAddr, uint8_t vptIdBits,
+                             uint32_t vintId, bool enable,
+                             Gicv3::GroupId group, uint8_t priority,
+                             bool clearPending);
+    bool injectOrPendVSGI(uint16_t vpeId, Addr vptAddr, uint8_t vptIdBits,
+                          uint32_t vintId);
     bool isPendingVLPI(Addr vptAddr, uint32_t vintId);
     void setClrVLPI(Addr vptAddr, uint32_t vintId, bool set);
     bool isVPEResident(uint16_t vpeId, Addr vptAddr) const;

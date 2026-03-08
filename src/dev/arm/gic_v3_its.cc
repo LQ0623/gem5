@@ -250,6 +250,23 @@ Gicv3Its::clearDefaultDoorbellPending(uint16_t vpeId)
     return resolvedDoorbell;
 }
 
+void
+Gicv3Its::sendVirtualSGI(uint16_t vpeId, uint32_t vintId)
+{
+    auto *vpe = findVPE(vpeId);
+    if (!vpe || !vpe->valid) {
+        warn("GITS_SGIR ignored: vPEID %u not mapped\n", vpeId);
+        return;
+    }
+    if (vintId >= Gicv3::SGI_MAX) {
+        warn("GITS_SGIR ignored: vINTID %u out of SGI range\n", vintId);
+        return;
+    }
+
+    auto *rd = getRedistributor(vpe->rdBase);
+    rd->injectOrPendVSGI(vpeId, vpe->vptAddr, vpe->vptIdBits, vintId);
+}
+
 ItsProcess::ItsProcess(Gicv3Its &_its)
   : its(_its), coroutine(nullptr)
 {
@@ -533,6 +550,7 @@ ItsCommand::DispatchTable ItsCommand::cmdDispatcher =
     COMMAND(VMOVI, &ItsCommand::vmovi),
     COMMAND(VMOVP, &ItsCommand::vmovp),
     COMMAND(VSYNC, &ItsCommand::vsync),
+    COMMAND(VSGI, &ItsCommand::vsgi),
 };
 
 ItsCommand::ItsCommand(Gicv3Its &_its)
@@ -1251,6 +1269,51 @@ ItsCommand::vsync(Yield &yield, CommandEntry &command)
     its.getRedistributor(vpe->rdBase)->invalidateVLPIConfigAll();
 }
 
+void
+ItsCommand::vsgi(Yield &yield, CommandEntry &command)
+{
+    const uint16_t vpeId = bits(command.raw[1], 15, 0);
+    const uint32_t vintId = bits(command.raw[1], 31, 16);
+    const bool enable = bits(command.raw[2], 0);
+    const bool group1Ns = bits(command.raw[2], 1);
+    const bool clear = bits(command.raw[2], 2);
+    const uint8_t priority = bits(command.raw[2], 15, 8);
+
+    if (its.vpeOutOfRange(vpeId)) {
+        warn("ITS VSGI rejected: vPEID %u out of range (max %u)\n",
+             vpeId, Gicv3Its::MAX_VPEID);
+        its.incrementReadPointer();
+        terminate(yield);
+    }
+
+    auto *vpe = its.findVPE(vpeId);
+    if (!vpe || !vpe->valid) {
+        warn("ITS VSGI rejected: vPEID %u not mapped\n", vpeId);
+        its.incrementReadPointer();
+        terminate(yield);
+    }
+
+    if (vintId >= Gicv3::SGI_MAX) {
+        warn("ITS VSGI rejected: vINTID %u out of SGI range\n", vintId);
+        its.incrementReadPointer();
+        terminate(yield);
+    }
+
+    /*
+     * 第一阶段统一策略：仅支持 Group1NS，其他 group 直接 reject，
+     * 避免软件误以为 Group0/Group1S 已被建模。
+     */
+    if (!group1Ns) {
+        warn("ITS VSGI rejected: only Group1NS is supported in stage-1\n");
+        its.incrementReadPointer();
+        terminate(yield);
+    }
+
+    its.getRedistributor(vpe->rdBase)->configureVirtualSGI(
+        vpeId, vpe->vptAddr, vpe->vptIdBits, vintId, enable,
+        Gicv3::G1NS, priority, clear);
+}
+
 Gicv3Its::Gicv3Its(const Gicv3ItsParams &params)
  : BasicPioDevice(params, params.pio_size),
    dmaPort(name() + ".dma", *this),
@@ -1258,6 +1321,7 @@ Gicv3Its::Gicv3Its(const Gicv3ItsParams &params)
    gitsTyper(params.gits_typer),
    gitsCbaser(0), gitsCreadr(0),
    gitsCwriter(0), gitsIidr(0),
+   gitsTranslater(0), gitsSgir(0),
    tableBases(NUM_BASER_REGS, 0),
    requestorId(params.system->getRequestorId(this)),
    gic(nullptr),
@@ -1350,6 +1414,14 @@ Gicv3Its::read(PacketPtr pkt)
         value = gitsTranslater;
         break;
 
+      case GITS_SGIR:
+        value = gitsSgir;
+        break;
+
+      case GITS_SGIR + 4:
+        value = bits(gitsSgir, 63, 32);
+        break;
+
       default:
         if (GITS_BASER.contains(addr)) {
             auto relative_addr = addr - GITS_BASER.start();
@@ -1436,6 +1508,31 @@ Gicv3Its::write(PacketPtr pkt)
       case GITS_TRANSLATER:
         if (gitsControl.enabled) {
             translate(pkt);
+        }
+        break;
+
+      case GITS_SGIR:
+        if (pkt->getSize() == sizeof(uint32_t)) {
+            gitsSgir = (gitsSgir & 0xffffffff00000000ULL) |
+                       pkt->getLE<uint32_t>();
+        } else {
+            assert(pkt->getSize() == sizeof(uint64_t));
+            gitsSgir = pkt->getLE<uint64_t>();
+        }
+        if (gitsControl.enabled) {
+            const uint16_t vpeId = bits(gitsSgir, 15, 0);
+            const uint32_t vintId = bits(gitsSgir, 19, 16);
+            sendVirtualSGI(vpeId, vintId);
+        }
+        break;
+
+      case GITS_SGIR + 4:
+        assert(pkt->getSize() == sizeof(uint32_t));
+        gitsSgir = insertBits(gitsSgir, 63, 32, pkt->getLE<uint32_t>());
+        if (gitsControl.enabled) {
+            const uint16_t vpeId = bits(gitsSgir, 15, 0);
+            const uint32_t vintId = bits(gitsSgir, 19, 16);
+            sendVirtualSGI(vpeId, vintId);
         }
         break;
 
@@ -1526,6 +1623,8 @@ Gicv3Its::serialize(CheckpointOut & cp) const
     SERIALIZE_SCALAR(gitsCreadr);
     SERIALIZE_SCALAR(gitsCwriter);
     SERIALIZE_SCALAR(gitsIidr);
+    SERIALIZE_SCALAR(gitsTranslater);
+    SERIALIZE_SCALAR(gitsSgir);
     SERIALIZE_CONTAINER(tableBases);
     const uint32_t numVirtualPes = virtualPes.size();
     SERIALIZE_SCALAR(numVirtualPes);
@@ -1563,6 +1662,8 @@ Gicv3Its::unserialize(CheckpointIn & cp)
     UNSERIALIZE_SCALAR(gitsCreadr);
     UNSERIALIZE_SCALAR(gitsCwriter);
     UNSERIALIZE_SCALAR(gitsIidr);
+    UNSERIALIZE_SCALAR(gitsTranslater);
+    UNSERIALIZE_SCALAR(gitsSgir);
     UNSERIALIZE_CONTAINER(tableBases);
     virtualPes.clear();
     uint32_t numVirtualPes;

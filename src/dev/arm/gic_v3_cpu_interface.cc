@@ -185,6 +185,30 @@ Gicv3CPUInterface::clearPendingVirtualLPI(uint32_t intid)
     return cleared;
 }
 
+bool
+Gicv3CPUInterface::injectVirtualSGI(uint32_t intid, uint8_t priority,
+                                    Gicv3::GroupId group)
+{
+    /*
+     * GICv4.1 vSGI 第一阶段最小语义：
+     * - 仅接受 SGI INTID 0..15；
+     * - 仅支持 Group1NS；
+     * - 其余 LR 分配/duplicate 处理完全复用 vLPI 逻辑。
+     */
+    if (intid >= Gicv3::SGI_MAX) {
+        warn("injectVirtualSGI cpu=%u rejected: intid=%u out of SGI range\n",
+             cpuId, intid);
+        return false;
+    }
+    if (group != Gicv3::G1NS) {
+        warn("injectVirtualSGI cpu=%u rejected: unsupported group=%u\n",
+             cpuId, static_cast<unsigned>(group));
+        return false;
+    }
+
+    return injectVirtualLPI(intid, priority, group);
+}
+
 void
 Gicv3CPUInterface::setThreadContext(ThreadContext *_tc)
 {

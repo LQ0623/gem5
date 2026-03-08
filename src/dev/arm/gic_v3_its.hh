@@ -152,7 +152,9 @@ class Gicv3Its : public BasicPioDevice
         GITS_PIDR2 = itsControl + 0xffe8,
 
         // Translation frame
-        GITS_TRANSLATER = itsTranslate + 0x0040
+        GITS_TRANSLATER = itsTranslate + 0x0040,
+        // GICv4.1 vSGI software generation register (stage-1 minimal model).
+        GITS_SGIR = itsTranslate + 0x0048
     };
 
     AddrRangeList getAddrRanges() const override;
@@ -230,6 +232,7 @@ class Gicv3Its : public BasicPioDevice
     CRDWR    gitsCwriter;
     uint32_t gitsIidr;
     uint32_t gitsTranslater;
+    uint64_t gitsSgir;
 
     std::vector<BASER> tableBases;
 
@@ -397,6 +400,7 @@ class Gicv3Its : public BasicPioDevice
                                 uint16_t &vpeId) const;
     bool requestDefaultDoorbell(uint16_t vpeId, uint32_t &doorbellIntid);
     uint32_t clearDefaultDoorbellPending(uint16_t vpeId);
+    void sendVirtualSGI(uint16_t vpeId, uint32_t vintId);
 
   private:
     std::queue<ItsAction> packetsToRetry;
@@ -536,7 +540,8 @@ class ItsCommand : public ItsProcess
         VMAPTI = 0x2A,
         VMOVI = 0x21,
         VMOVP = 0x22,
-        VSYNC = 0x25
+        VSYNC = 0x25,
+        VSGI = 0x2E
     };
 
     ItsCommand(Gicv3Its &_its);
@@ -592,6 +597,7 @@ class ItsCommand : public ItsProcess
     void vmovi(Yield &yield, CommandEntry &command);
     void vmovp(Yield &yield, CommandEntry &command);
     void vsync(Yield &yield, CommandEntry &command);
+    void vsgi(Yield &yield, CommandEntry &command);
 
   protected: // Helpers
     bool idOutOfRange(CommandEntry &command, DTE dte) const

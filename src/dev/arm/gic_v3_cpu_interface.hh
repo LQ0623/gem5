@@ -359,6 +359,9 @@ class Gicv3CPUInterface : public ArmISA::BaseISADevice, public Serializable
     // vLPI direct inject 的 LR 写入口（含 duplicate vINTID 升级语义）。
     bool injectVirtualLPI(uint32_t intid, uint8_t priority,
                           Gicv3::GroupId group = Gicv3::G1NS);
+    // vSGI direct inject 最小入口：当前阶段仅覆盖 resident + Group1NS。
+    bool injectVirtualSGI(uint32_t intid, uint8_t priority,
+                          Gicv3::GroupId group = Gicv3::G1NS);
     // CLEAR/DISCARD 使用的 pending 清理入口（保留 ACTIVE 状态约束）。
     bool clearPendingVirtualLPI(uint32_t intid);
 

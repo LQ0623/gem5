@@ -1190,6 +1190,179 @@ Gicv3Redistributor::invalidateVLPIConfigAll()
     invalidateVLPIConfigAllImpl(false);
 }
 
+bool
+Gicv3Redistributor::vsgiStateAddr(Addr vptAddr, uint8_t vptIdBits,
+                                  Addr &stateAddr) const
+{
+    if (!vptAddr) {
+        return false;
+    }
+
+    const uint8_t effIdBits = std::min<uint8_t>(vptIdBits, 0xf);
+    const uint64_t pendingTableBytes = (1ULL << (effIdBits + 1)) / 8ULL;
+    if (pendingTableBytes < 16ULL) {
+        return false;
+    }
+
+    /*
+     * GICv4.1 vSGI 最小模型：
+     * 把 vPT 末尾 128bit 作为 vSGI 配置/状态槽。
+     *   bit [15:0]   : Pending[15:0]
+     *   bit [31:16]  : Enable[15:0]
+     *   bit [47:32]  : Group[15:0] (1 表示 Group1NS)
+     *   bit [127:48] : Priority[15:0]，每个 vSGI 5bit
+     */
+    stateAddr = vptAddr + pendingTableBytes - 16ULL;
+    return true;
+}
+
+__uint128_t
+Gicv3Redistributor::readVsgiStateRaw(Addr stateAddr) const
+{
+    uint64_t low = 0;
+    uint64_t high = 0;
+    memProxy->readBlob(stateAddr, &low, sizeof(low));
+    memProxy->readBlob(stateAddr + sizeof(low), &high, sizeof(high));
+    return (static_cast<__uint128_t>(high) << 64) | low;
+}
+
+void
+Gicv3Redistributor::writeVsgiStateRaw(Addr stateAddr, __uint128_t state)
+{
+    const uint64_t low = static_cast<uint64_t>(state);
+    const uint64_t high = static_cast<uint64_t>(state >> 64);
+    memProxy->writeBlob(stateAddr, &low, sizeof(low));
+    memProxy->writeBlob(stateAddr + sizeof(low), &high, sizeof(high));
+}
+
+bool
+Gicv3Redistributor::configureVirtualSGI(uint16_t vpeId, Addr vptAddr,
+                                        uint8_t vptIdBits, uint32_t vintId,
+                                        bool enable, Gicv3::GroupId group,
+                                        uint8_t priority, bool clearPending)
+{
+    if (vintId >= Gicv3::SGI_MAX) {
+        return false;
+    }
+
+    Addr stateAddr = 0;
+    if (!vsgiStateAddr(vptAddr, vptIdBits, stateAddr)) {
+        return false;
+    }
+
+    __uint128_t state = readVsgiStateRaw(stateAddr);
+    const uint16_t bit = static_cast<uint16_t>(1u << vintId);
+    uint16_t pending = static_cast<uint16_t>(state & 0xffffu);
+    uint16_t enableBits = static_cast<uint16_t>((state >> 16) & 0xffffu);
+    uint16_t groupBits = static_cast<uint16_t>((state >> 32) & 0xffffu);
+
+    if (enable) {
+        enableBits |= bit;
+    } else {
+        enableBits &= ~bit;
+    }
+
+    if (group == Gicv3::G1NS) {
+        groupBits |= bit;
+    } else {
+        groupBits &= ~bit;
+    }
+
+    if (clearPending) {
+        pending &= ~bit;
+        if (isVPEResident(vpeId, vptAddr)) {
+            /*
+             * VSGI(Clear=1) 在 resident 上同时清 LR pending 分量，
+             * 避免“表清了但 LR 里还残留 ACTIVE_PENDING”。
+             */
+            cpuInterface->clearPendingVirtualLPI(vintId);
+        }
+    }
+
+    const uint8_t prio5 = static_cast<uint8_t>((priority >> 3) & 0x1f);
+    const unsigned prioShift = 48u + vintId * 5u;
+    state &= ~((static_cast<__uint128_t>(0x1f)) << prioShift);
+    state |= (static_cast<__uint128_t>(prio5) << prioShift);
+
+    state &= ~static_cast<__uint128_t>(0xffffu);
+    state |= static_cast<__uint128_t>(pending);
+    state &= ~(static_cast<__uint128_t>(0xffffu) << 16);
+    state |= (static_cast<__uint128_t>(enableBits) << 16);
+    state &= ~(static_cast<__uint128_t>(0xffffu) << 32);
+    state |= (static_cast<__uint128_t>(groupBits) << 32);
+
+    writeVsgiStateRaw(stateAddr, state);
+    return true;
+}
+
+bool
+Gicv3Redistributor::injectOrPendVSGI(uint16_t vpeId, Addr vptAddr,
+                                     uint8_t vptIdBits, uint32_t vintId)
+{
+    if (vintId >= Gicv3::SGI_MAX) {
+        return false;
+    }
+
+    Addr stateAddr = 0;
+    if (!vsgiStateAddr(vptAddr, vptIdBits, stateAddr)) {
+        return false;
+    }
+
+    __uint128_t state = readVsgiStateRaw(stateAddr);
+    const uint16_t bit = static_cast<uint16_t>(1u << vintId);
+    uint16_t pending = static_cast<uint16_t>(state & 0xffffu);
+    const uint16_t enableBits = static_cast<uint16_t>((state >> 16) & 0xffffu);
+    const uint16_t groupBits = static_cast<uint16_t>((state >> 32) & 0xffffu);
+
+    const bool enabled = (enableBits & bit) != 0;
+    const bool group1Ns = (groupBits & bit) != 0;
+    const unsigned prioShift = 48u + vintId * 5u;
+    const uint8_t priority =
+        static_cast<uint8_t>(((state >> prioShift) & 0x1fu) << 3);
+
+    // SGIR 到达先置 pending，再根据 resident/config 决定是否可直注入。
+    pending |= bit;
+    state &= ~static_cast<__uint128_t>(0xffffu);
+    state |= static_cast<__uint128_t>(pending);
+    writeVsgiStateRaw(stateAddr, state);
+
+    if (!enabled) {
+        DPRINTF(GIC, "injectOrPendVSGI cpu=%u vpe=%u"
+                " vintid=%u action=disabled\n",
+                cpuId, vpeId, vintId);
+        return false;
+    }
+    if (!group1Ns) {
+        DPRINTF(GIC, "injectOrPendVSGI cpu=%u vpe=%u"
+                " vintid=%u action=group_not_supported\n",
+                cpuId, vpeId, vintId);
+        return false;
+    }
+
+    if (!isVPEResident(vpeId, vptAddr)) {
+        /*
+         * 第一阶段只实现 resident 直注入闭环。
+         * non-resident 场景仅保留 pending 位，不做 replay/doorbell。
+         */
+        warn("injectOrPendVSGI cpu=%u vpe=%u vintid=%u non-resident: "
+             "pending recorded without replay in stage-1 model\n",
+             cpuId, vpeId, vintId);
+        return false;
+    }
+
+    if (!cpuInterface->injectVirtualSGI(vintId, priority, Gicv3::G1NS)) {
+        return false;
+    }
+
+    pending &= ~bit;
+    state &= ~static_cast<__uint128_t>(0xffffu);
+    state |= static_cast<__uint128_t>(pending);
+    writeVsgiStateRaw(stateAddr, state);
+    DPRINTF(GIC, "injectOrPendVSGI cpu=%u vpe=%u vintid=%u action=delivered\n",
+            cpuId, vpeId, vintId);
+    return true;
+}
+
 void
 Gicv3Redistributor::syncResidentPendingStateToVpt()
 {
