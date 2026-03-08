@@ -89,6 +89,7 @@ Gicv3Redistributor::Gicv3Redistributor(Gicv3 * gic, uint32_t cpu_id)
       vLpiPendingLast(false),
       residentVpeId(0xffff),
       residentVptAddr(0),
+      residentVptIdBits(0xf),
       lpiSyncBusyReads(0),
       addrRangeSize(gic->params().gicv4 ? 0x40000 : 0x20000)
 {
@@ -263,8 +264,24 @@ Gicv3Redistributor::read(Addr addr, size_t size, bool is_secure_access)
       case GICR_ISPENDR0: // Interrupt Set-Pending Register 0
       case GICR_ICPENDR0: { // Interrupt Clear-Pending Register 0
           uint64_t value = 0;
+          const bool resident_vsgi = vLpiPendingTableValid &&
+              residentVpeId != 0xffff && residentVptAddr != 0;
+          const uint16_t vsgiPending = resident_vsgi ?
+              readVSGIPendingBitmap(residentVptAddr, residentVptIdBits) : 0;
 
           for (int int_id = 0; int_id < 8 * size; int_id++) {
+              if (resident_vsgi && int_id < Gicv3::SGI_MAX) {
+                  /*
+                   * vSGI guest-visible pending 最小模型：
+                   * 这里优先暴露 resident vSGI 的 pending 位，不依赖
+                   * 物理 SGI 的 group/security 过滤。
+                   */
+                  const bool vsgiPend = (vsgiPending & (1u << int_id)) != 0;
+                  const bool pending = irqPending[int_id] || vsgiPend;
+                  value |= (pending << int_id);
+                  continue;
+              }
+
               if (!distributor->DS && !is_secure_access) {
                   // RAZ/WI for non-secure accesses for secure interrupts
                   if (getIntGroup(int_id) != Gicv3::G1NS) {
@@ -272,7 +289,9 @@ Gicv3Redistributor::read(Addr addr, size_t size, bool is_secure_access)
                   }
               }
 
-              value |= (irqPending[int_id] << int_id);
+              bool pending = irqPending[int_id];
+
+              value |= (pending << int_id);
           }
 
           return value;
@@ -524,7 +543,26 @@ Gicv3Redistributor::write(Addr addr, uint64_t data, size_t size,
         break;
 
       case GICR_ISPENDR0: // Interrupt Set-Pending Register 0
+      {
+        const bool resident_vsgi = vLpiPendingTableValid &&
+            residentVpeId != 0xffff && residentVptAddr != 0;
         for (int int_id = 0; int_id < 8 * size; int_id++) {
+            bool pending = data & (1 << int_id) ? 1 : 0;
+            if (!pending) {
+                continue;
+            }
+
+            if (resident_vsgi && int_id < Gicv3::SGI_MAX) {
+                /*
+                 * vSGI guest-visible pending 最小模型：
+                 * resident 时 SGI 位走虚拟注入/置 pending 路径，不受
+                 * 物理 SGI group/security 属性限制。
+                 */
+                injectOrPendVSGI(residentVpeId, residentVptAddr,
+                                 residentVptIdBits, int_id);
+                continue;
+            }
+
             if (!distributor->DS && !is_secure_access) {
                 // RAZ/WI for non-secure accesses for secure interrupts
                 if (getIntGroup(int_id) != Gicv3::G1NS) {
@@ -532,30 +570,43 @@ Gicv3Redistributor::write(Addr addr, uint64_t data, size_t size,
                 }
             }
 
-            bool pending = data & (1 << int_id) ? 1 : 0;
-
-            if (pending) {
-                DPRINTF(GIC, "Gicv3Redistributor::write() "
-                        "(GICR_ISPENDR0): int_id %d (PPI) "
-                        "pending bit set\n", int_id);
-                irqPending[int_id] = true;
-                irqPendingIspendr[int_id] = true;
-            }
+            DPRINTF(GIC, "Gicv3Redistributor::write() "
+                    "(GICR_ISPENDR0): int_id %d (PPI) "
+                    "pending bit set\n", int_id);
+            irqPending[int_id] = true;
+            irqPendingIspendr[int_id] = true;
         }
 
         updateDistributor();
         break;
+      }
 
       case GICR_ICPENDR0:// Interrupt Clear-Pending Register 0
+      {
+        const bool resident_vsgi = vLpiPendingTableValid &&
+            residentVpeId != 0xffff && residentVptAddr != 0;
         for (int int_id = 0; int_id < 8 * size; int_id++) {
+            bool clear = data & (1 << int_id) ? 1 : 0;
+            if (!clear) {
+                continue;
+            }
+
+            if (resident_vsgi && int_id < Gicv3::SGI_MAX) {
+                /*
+                 * 清 resident vSGI pending：同时清 vPT 位，并把 LR 中
+                 * 的 pending 分量（PENDING/ACTIVE_PENDING）一并清掉。
+                 */
+                setClrVSGIPending(residentVpeId, residentVptAddr,
+                                  residentVptIdBits, int_id, false, true);
+                continue;
+            }
+
             if (!distributor->DS && !is_secure_access) {
                 // RAZ/WI for non-secure accesses for secure interrupts
                 if (getIntGroup(int_id) != Gicv3::G1NS) {
                     continue;
                 }
             }
-
-            bool clear = data & (1 << int_id) ? 1 : 0;
 
             if (clear && treatAsEdgeTriggered(int_id)) {
                 irqPending[int_id] = false;
@@ -563,6 +614,7 @@ Gicv3Redistributor::write(Addr addr, uint64_t data, size_t size,
         }
 
         break;
+      }
 
       case GICR_ISACTIVER0: // Interrupt Set-Active Register 0
         for (int int_id = 0; int_id < 8 * size; int_id++) {
@@ -773,6 +825,7 @@ Gicv3Redistributor::write(Addr addr, uint64_t data, size_t size,
         vLpiPendingTablePtr = data & 0xFFFFFFFFF0000ULL;
         residentVptAddr = 0;
         residentVpeId = 0xffff;
+        residentVptIdBits = 0xf;
         break;
       }
 
@@ -1235,6 +1288,77 @@ Gicv3Redistributor::writeVsgiStateRaw(Addr stateAddr, __uint128_t state)
     memProxy->writeBlob(stateAddr + sizeof(low), &high, sizeof(high));
 }
 
+uint16_t
+Gicv3Redistributor::readVSGIPendingBitmap(Addr vptAddr,
+                                          uint8_t vptIdBits) const
+{
+    Addr stateAddr = 0;
+    if (!vsgiStateAddr(vptAddr, vptIdBits, stateAddr)) {
+        return 0;
+    }
+
+    const __uint128_t state = readVsgiStateRaw(stateAddr);
+    return static_cast<uint16_t>(state & 0xffffu);
+}
+
+bool
+Gicv3Redistributor::setClrVSGIPending(uint16_t vpeId, Addr vptAddr,
+                                      uint8_t vptIdBits, uint32_t vintId,
+                                      bool set, bool clearResidentLr)
+{
+    if (vintId >= Gicv3::SGI_MAX) {
+        return false;
+    }
+
+    Addr stateAddr = 0;
+    if (!vsgiStateAddr(vptAddr, vptIdBits, stateAddr)) {
+        return false;
+    }
+
+    __uint128_t state = readVsgiStateRaw(stateAddr);
+    uint16_t pending = static_cast<uint16_t>(state & 0xffffu);
+    const uint16_t bit = static_cast<uint16_t>(1u << vintId);
+    const bool wasSet = (pending & bit) != 0;
+
+    if (set) {
+        pending |= bit;
+    } else {
+        pending &= ~bit;
+    }
+
+    state &= ~static_cast<__uint128_t>(0xffffu);
+    state |= static_cast<__uint128_t>(pending);
+    writeVsgiStateRaw(stateAddr, state);
+
+    if (!set && clearResidentLr && isVPEResident(vpeId, vptAddr)) {
+        cpuInterface->clearPendingVirtualLPI(vintId);
+    }
+
+    return wasSet != ((pending & bit) != 0);
+}
+
+void
+Gicv3Redistributor::replayPendingVSGIs(uint16_t vpeId, Addr vptAddr,
+                                       uint8_t vptIdBits)
+{
+    const uint16_t pending = readVSGIPendingBitmap(vptAddr, vptIdBits);
+    if (!pending) {
+        return;
+    }
+
+    /*
+     * non-resident -> resident replay：
+     * 最小模型按位扫描 16 个 vSGI，成功注入后由 injectOrPendVSGI
+     * 清对应 pending 位；若 LR 紧张则位保持为 1，等待后续机会。
+     */
+    for (uint32_t intid = 0; intid < Gicv3::SGI_MAX; intid++) {
+        if (!(pending & (1u << intid))) {
+            continue;
+        }
+        injectOrPendVSGI(vpeId, vptAddr, vptIdBits, intid);
+    }
+}
+
 bool
 Gicv3Redistributor::configureVirtualSGI(uint16_t vpeId, Addr vptAddr,
                                         uint8_t vptIdBits, uint32_t vintId,
@@ -1270,13 +1394,6 @@ Gicv3Redistributor::configureVirtualSGI(uint16_t vpeId, Addr vptAddr,
 
     if (clearPending) {
         pending &= ~bit;
-        if (isVPEResident(vpeId, vptAddr)) {
-            /*
-             * VSGI(Clear=1) 在 resident 上同时清 LR pending 分量，
-             * 避免“表清了但 LR 里还残留 ACTIVE_PENDING”。
-             */
-            cpuInterface->clearPendingVirtualLPI(vintId);
-        }
     }
 
     const uint8_t prio5 = static_cast<uint8_t>((priority >> 3) & 0x1f);
@@ -1292,6 +1409,13 @@ Gicv3Redistributor::configureVirtualSGI(uint16_t vpeId, Addr vptAddr,
     state |= (static_cast<__uint128_t>(groupBits) << 32);
 
     writeVsgiStateRaw(stateAddr, state);
+    if (clearPending) {
+        /*
+         * 清 pending 时统一走 helper，保证表状态与 resident LR
+         * 的 pending 分量同步清除，避免双重真相。
+         */
+        setClrVSGIPending(vpeId, vptAddr, vptIdBits, vintId, false, true);
+    }
     return true;
 }
 
@@ -1308,9 +1432,8 @@ Gicv3Redistributor::injectOrPendVSGI(uint16_t vpeId, Addr vptAddr,
         return false;
     }
 
-    __uint128_t state = readVsgiStateRaw(stateAddr);
+    const __uint128_t state = readVsgiStateRaw(stateAddr);
     const uint16_t bit = static_cast<uint16_t>(1u << vintId);
-    uint16_t pending = static_cast<uint16_t>(state & 0xffffu);
     const uint16_t enableBits = static_cast<uint16_t>((state >> 16) & 0xffffu);
     const uint16_t groupBits = static_cast<uint16_t>((state >> 32) & 0xffffu);
 
@@ -1320,11 +1443,8 @@ Gicv3Redistributor::injectOrPendVSGI(uint16_t vpeId, Addr vptAddr,
     const uint8_t priority =
         static_cast<uint8_t>(((state >> prioShift) & 0x1fu) << 3);
 
-    // SGIR 到达先置 pending，再根据 resident/config 决定是否可直注入。
-    pending |= bit;
-    state &= ~static_cast<__uint128_t>(0xffffu);
-    state |= static_cast<__uint128_t>(pending);
-    writeVsgiStateRaw(stateAddr, state);
+    // SGIR 到达先置 pending；重复发送在最小模型下自然合并到同一 bit。
+    setClrVSGIPending(vpeId, vptAddr, vptIdBits, vintId, true, false);
 
     if (!enabled) {
         DPRINTF(GIC, "injectOrPendVSGI cpu=%u vpe=%u"
@@ -1340,13 +1460,10 @@ Gicv3Redistributor::injectOrPendVSGI(uint16_t vpeId, Addr vptAddr,
     }
 
     if (!isVPEResident(vpeId, vptAddr)) {
-        /*
-         * 第一阶段只实现 resident 直注入闭环。
-         * non-resident 场景仅保留 pending 位，不做 replay/doorbell。
-         */
-        warn("injectOrPendVSGI cpu=%u vpe=%u vintid=%u non-resident: "
-             "pending recorded without replay in stage-1 model\n",
-             cpuId, vpeId, vintId);
+        // non-resident：本阶段记录 pending，等待 schedule-on replay。
+        DPRINTF(GIC, "injectOrPendVSGI cpu=%u vpe=%u vintid=%u"
+                " action=pend_nonresident\n",
+                cpuId, vpeId, vintId);
         return false;
     }
 
@@ -1354,10 +1471,7 @@ Gicv3Redistributor::injectOrPendVSGI(uint16_t vpeId, Addr vptAddr,
         return false;
     }
 
-    pending &= ~bit;
-    state &= ~static_cast<__uint128_t>(0xffffu);
-    state |= static_cast<__uint128_t>(pending);
-    writeVsgiStateRaw(stateAddr, state);
+    setClrVSGIPending(vpeId, vptAddr, vptIdBits, vintId, false, false);
     DPRINTF(GIC, "injectOrPendVSGI cpu=%u vpe=%u vintid=%u action=delivered\n",
             cpuId, vpeId, vintId);
     return true;
@@ -1390,11 +1504,14 @@ Gicv3Redistributor::syncResidentPendingStateToVpt()
             continue;
         }
 
-        if (vintId < SMALLEST_LPI_ID) {
+        if (vintId < Gicv3::SGI_MAX) {
+            setClrVSGIPending(residentVpeId, residentVptAddr,
+                              residentVptIdBits, vintId, true, false);
+        } else if (vintId >= SMALLEST_LPI_ID) {
+            setClrVLPI(residentVptAddr, vintId, true);
+        } else {
             continue;
         }
-
-        setClrVLPI(residentVptAddr, vintId, true);
 
         if (state == Gicv3CPUInterface::ICH_LR_EL2_STATE_PENDING) {
             lrRaw = insertBits(lrRaw, 63, 62,
@@ -1450,16 +1567,20 @@ Gicv3Redistributor::scheduleVpeOn(uint64_t data)
     vLpiPendingTableDirty = false;
     residentVptAddr = vLpiPendingTablePtr;
     residentVpeId = bits(data, 15, 0);
+    residentVptIdBits = 0xf;
 
     auto *its = gic->getIts();
     if (its) {
         uint16_t matchedVpeId = residentVpeId;
+        uint8_t matchedVptIdBits = residentVptIdBits;
         if (its->findVPEForRedistributor(
                 this,
                 residentVptAddr,
-                matchedVpeId)) {
+                matchedVpeId,
+                &matchedVptIdBits)) {
             // 以 ITS 运行态映射为准修正 vPEID，避免软件编码与运行态不一致。
             residentVpeId = matchedVpeId;
+            residentVptIdBits = matchedVptIdBits;
         }
 
         // 重新 schedule 时清掉上一 non-resident 区间的 default doorbell 闩锁。
@@ -1471,6 +1592,9 @@ Gicv3Redistributor::scheduleVpeOn(uint64_t data)
 
         its->syncPendingVirtualLpis(this);
     }
+
+    // vSGI non-resident pending 在 schedule-on 时 replay。
+    replayPendingVSGIs(residentVpeId, residentVptAddr, residentVptIdBits);
 
     /*
      * 最小 schedule 语义：
@@ -1507,6 +1631,7 @@ Gicv3Redistributor::scheduleVpeOff()
 
     residentVptAddr = 0;
     residentVpeId = 0xffff;
+    residentVptIdBits = 0xf;
 }
 
 
@@ -1801,6 +1926,7 @@ Gicv3Redistributor::serialize(CheckpointOut & cp) const
     SERIALIZE_SCALAR(vLpiPendingLast);
     SERIALIZE_SCALAR(residentVpeId);
     SERIALIZE_SCALAR(residentVptAddr);
+    SERIALIZE_SCALAR(residentVptIdBits);
     SERIALIZE_SCALAR(lpiSyncBusyReads);
 }
 
@@ -1832,6 +1958,7 @@ Gicv3Redistributor::unserialize(CheckpointIn & cp)
     UNSERIALIZE_SCALAR(vLpiPendingLast);
     UNSERIALIZE_SCALAR(residentVpeId);
     UNSERIALIZE_SCALAR(residentVptAddr);
+    UNSERIALIZE_SCALAR(residentVptIdBits);
     UNSERIALIZE_SCALAR(lpiSyncBusyReads);
     vLpiConfigCache.clear();
 }

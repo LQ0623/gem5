@@ -397,7 +397,8 @@ class Gicv3Its : public BasicPioDevice
   public:
     void syncPendingVirtualLpis(Gicv3Redistributor *rd);
     bool findVPEForRedistributor(Gicv3Redistributor *rd, Addr vptAddr,
-                                uint16_t &vpeId) const;
+                                uint16_t &vpeId,
+                                uint8_t *vptIdBits = nullptr) const;
     bool requestDefaultDoorbell(uint16_t vpeId, uint32_t &doorbellIntid);
     uint32_t clearDefaultDoorbellPending(uint16_t vpeId);
     void sendVirtualSGI(uint16_t vpeId, uint32_t vintId);

@@ -148,7 +148,7 @@ Gicv3Its::syncPendingVirtualLpis(Gicv3Redistributor *rd)
 
 bool
 Gicv3Its::findVPEForRedistributor(Gicv3Redistributor *rd, Addr vptAddr,
-                                 uint16_t &vpeId) const
+                                 uint16_t &vpeId, uint8_t *vptIdBits) const
 {
     if (!rd || vptAddr == 0) {
         return false;
@@ -165,6 +165,9 @@ Gicv3Its::findVPEForRedistributor(Gicv3Redistributor *rd, Addr vptAddr,
         }
 
         vpeId = entry.first;
+        if (vptIdBits) {
+            *vptIdBits = vpe.vptIdBits;
+        }
         return true;
     }
 

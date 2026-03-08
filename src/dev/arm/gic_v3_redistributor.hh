@@ -203,6 +203,8 @@ class Gicv3Redistributor : public Serializable
     uint16_t residentVpeId;
     // 当前 resident vPE 的 vPT 基地址。
     Addr residentVptAddr;
+    // 当前 resident vPE 的 vPT IDbits（用于定位 vSGI state 尾部区域）。
+    uint8_t residentVptIdBits;
     // GICR_SYNCR.Busy 的最小实现：按读次数脉冲。
     uint8_t lpiSyncBusyReads;
 
@@ -232,6 +234,10 @@ class Gicv3Redistributor : public Serializable
     bool vsgiStateAddr(Addr vptAddr, uint8_t vptIdBits, Addr &stateAddr) const;
     __uint128_t readVsgiStateRaw(Addr stateAddr) const;
     void writeVsgiStateRaw(Addr stateAddr, __uint128_t state);
+    uint16_t readVSGIPendingBitmap(Addr vptAddr, uint8_t vptIdBits) const;
+    bool setClrVSGIPending(uint16_t vpeId, Addr vptAddr, uint8_t vptIdBits,
+                           uint32_t vintId, bool set, bool clearResidentLr);
+    void replayPendingVSGIs(uint16_t vpeId, Addr vptAddr, uint8_t vptIdBits);
 
     BitUnion8(LPIConfigurationTableEntry)
         Bitfield<7, 2> priority;
