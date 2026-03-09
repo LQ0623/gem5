@@ -1554,7 +1554,12 @@ Gicv3Redistributor::injectOrPendVSGI(uint16_t vpeId, Addr vptAddr,
     const uint8_t priority =
         static_cast<uint8_t>(((state >> prioShift) & 0x1fu) << 3);
 
-    // SGIR 到达先置 pending；重复发送在最小模型下自然合并到同一 bit。
+    /*
+     * SGIR / ISPENDR 到达先置 pending：
+     * - duplicate 在最小模型下自然合并到同一 bit；
+     * - 即使暂时不可投递（如 disabled / non-resident），
+     *   也能通过 VSGIPENDR 与 replay 路径被观测/消费。
+     */
     setClrVSGIPending(vpeId, vptAddr, vptIdBits, vintId, true, false);
 
     if (!enabled) {
