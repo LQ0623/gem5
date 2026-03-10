@@ -256,6 +256,12 @@ Gicv3Its::clearDefaultDoorbellPending(uint16_t vpeId)
 void
 Gicv3Its::sendVirtualSGI(uint16_t vpeId, uint32_t vintId)
 {
+    /*
+     * vSGI 统一注入入口（最小模型）：
+     * - 直接 MMIO 写 GITS_SGIR 走这里；
+     * - guest ICC_SGI1R_EL1 trap+translate 后也应落到这里。
+     * 这样可以保证两条路径共享同一份 pending/replay 真相。
+     */
     auto *vpe = findVPE(vpeId);
     if (!vpe || !vpe->valid) {
         warn("GITS_SGIR ignored: vPEID %u not mapped\n", vpeId);
@@ -1242,6 +1248,11 @@ ItsCommand::vmovp(Yield &yield, CommandEntry &command)
         terminate(yield);
     }
 
+    /*
+     * 非 resident VMOVP 最小策略：
+     * 仅更新 vPE->RD 绑定关系，不在这里做额外“猜测性注入”；
+     * 迁移后的可见行为由后续 sync/replay 统一收敛。
+     */
     vpe->rdBase = bits(command.raw[2], 50, 16);
     its.syncPendingVirtualLpis(its.getRedistributor(vpe->rdBase));
 }

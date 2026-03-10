@@ -1823,6 +1823,12 @@ Gicv3Redistributor::injectOrPendVLPI(uint16_t vpeId, uint32_t vintId,
                                      uint32_t doorbellIntid,
                                      Gicv3::GroupId group)
 {
+    /*
+     * vLPI direct injection 主分流点：
+     * - resident: 尝试直接塞入 LR（绕开 EL2 trap&emulate 数据路径）；
+     * - non-resident: 只落 pending table，并按条件请求 default doorbell。
+     * 这也是论文里“软件注入 vs 直注入”对比的关键入口。
+     */
     if (vintId < SMALLEST_LPI_ID) {
         return false;
     }
@@ -1887,13 +1893,9 @@ Gicv3Redistributor::injectOrPendVLPI(uint16_t vpeId, uint32_t vintId,
     DPRINTF(GIC, "injectOrPendVLPI cpu=%u vintid=%u action=delivered_clear_pending\n",
             cpuId, vintId);
     /*
-     * Direct-injection delivery semantics:
-     * - clear the vPT pending bit after successful LR injection
-     * - but do NOT clear resident LR pending state here.
-     *
-     * setClrVLPI(..., false) is used by CLEAR/DISCARD style maintenance
-     * commands and may clear resident LR state (via clearPendingVirtualLPI).
-     * Using it here would erase the just-delivered LR before EL1 sees it.
+     * 直注入成功后仅清 vPT pending，不清 LR 中刚写入的 pending：
+     * 否则会退化成“刚注入马上又被维护路径清掉”，guest 看不到中断。
+     * 该分离语义对应 tc1/tc3/tc4 的可观测行为。
      */
     if (vptAddr && vintId >= SMALLEST_LPI_ID) {
         const Addr pendingByteAddr = vptAddr + (vintId / 8);

@@ -1526,6 +1526,12 @@ Gicv3CPUInterface::setMiscReg(int misc_reg, RegVal val)
       // Software Generated Interrupt Group 1 Register
       case MISCREG_ICC_SGI1R:
       case MISCREG_ICC_SGI1R_EL1: {
+        /*
+         * 这里是“未被 EL2 trap 截获”时的硬件路径：
+         * 直接按 ICC_SGI1R 编码路由到目标 redistributor。
+         * 对应论文里的对照面：若 hypervisor 选择 trap+translate，
+         * 则会在 EL2 把请求重定向到 GITS_SGIR，而不会走到此处。
+         */
         Gicv3::GroupId group = inSecureState() ? Gicv3::G1S : Gicv3::G1NS;
 
         generateSGI(val, group);
@@ -1915,6 +1921,13 @@ Gicv3CPUInterface::virtualDropPriority()
 void
 Gicv3CPUInterface::generateSGI(RegVal val, Gicv3::GroupId group)
 {
+    /*
+     * SGI 路由按架构字段解码：
+     * Aff3/Aff2/Aff1/TargetList/IRM/RS -> 目标 PE 集合。
+     * 本函数负责“本地 CPU 接口原生发 SGI”的通路；
+     * vSGI direct injection 的 trap+translate 方案则可在 EL2 把同类字段
+     * 转换成 GITS_SGIR，由 ITS/Redistributor 统一处理 pending/replay。
+     */
     uint8_t aff3 = bits(val, 55, 48);
     uint8_t aff2 = bits(val, 39, 32);
     uint8_t aff1 = bits(val, 23, 16);;
