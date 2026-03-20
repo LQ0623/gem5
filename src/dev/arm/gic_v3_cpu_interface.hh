@@ -424,6 +424,21 @@ class Gicv3CPUInterface : public ArmISA::BaseISADevice, public Serializable
         return (idx >= 0) ? (activeIrqCount[idx] > 0) : false;
     }
 
+    // SPI 1-of-N 负载感知路由用的最小可观测接口。
+    // 这些值是“近似负载”，目标是稳定、低成本，不引入新的复杂状态机。
+    uint32_t activeCountForRouting(Gicv3::GroupId group) const
+    {
+        const int idx = busyGroupIndex(group);
+        return (idx >= 0) ? activeIrqCount[idx] : 0;
+    }
+
+    uint32_t pendingCountForRouting(Gicv3::GroupId group) const
+    {
+        // hppi 是该 PE 当前最高优先级物理 pending 的聚合视图。
+        // 对 1-of-N 评分来说，0/1 粗粒度就足够区分“空闲”和“已有待处理中断”。
+        return (hppi.prio != 0xff && hppi.group == group) ? 1 : 0;
+    }
+
 };
 
 } // namespace gem5

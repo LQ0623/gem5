@@ -41,6 +41,11 @@
 #ifndef __DEV_ARM_GICV3_DISTRIBUTOR_H__
 #define __DEV_ARM_GICV3_DISTRIBUTOR_H__
 
+#include <array>
+#include <cstdint>
+#include <string>
+#include <vector>
+
 #include "base/addr_range.hh"
 #include "dev/arm/gic_v3.hh"
 #include "sim/serialize.hh"
@@ -272,6 +277,7 @@ class Gicv3Distributor : public Serializable
     void serialize(CheckpointOut & cp) const override;
     void unserialize(CheckpointIn & cp) override;
     Gicv3CPUInterface* route(uint32_t int_id);
+    ~Gicv3Distributor() override;
 
   public:
 
@@ -290,12 +296,77 @@ class Gicv3Distributor : public Serializable
     void update();
 
   private:
+    enum class OneOfNRouteAlgo : uint8_t
+    {
+        FirstFit = 0,
+        RoundRobin,
+        BusyAwareRoundRobin,
+        LeastLoad,
+        PowerOfTwoChoices,
+        StickyLoadAware,
+        WeightedRoundRobin
+    };
+
+    struct RouteCandidate
+    {
+        int cpuIndex = -1;
+        int scanIndex = -1;
+        Gicv3Redistributor *rd = nullptr;
+        Gicv3CPUInterface *ci = nullptr;
+        bool busy = false;
+        uint32_t pendingCount = 0;
+        uint32_t activeCount = 0;
+        uint32_t recentRouteCount = 0;
+        uint64_t score = 0;
+    };
+
+    OneOfNRouteAlgo oneOfNRouteAlgo;
     bool enable1ofNRR;
     bool enable1ofNBusyAware;
 
-    // Round-robin cursor for IRM=1 routing (per-distributor)
-    uint32_t rrCursor1ofN = -1;
-    std::vector<int> lastRoutedCpu; // size = numInterrupts, init -1
+    // 为不同 group 维护独立 cursor，避免不同流量类型互相扰动。
+    std::array<int32_t, 3> rrCursor1ofN;
+    std::vector<int32_t> lastRoutedCpu; // size = numInterrupts, init -1
+
+    // 路由观测字段：用于评测阶段统计，不影响功能语义。
+    std::vector<uint64_t> cpuRouteSelectCount;
+    std::vector<uint32_t> recentRouteCountWindow;
+    std::array<uint64_t, 3> routeCallsByGroup;
+    uint64_t totalRouteCalls1ofN;
+    uint64_t totalScanLength1ofN;
+    uint64_t totalCandidateCount1ofN;
+    uint64_t busyHitCount1ofN;
+    uint64_t routeSwitchCount1ofN;
+
+    uint32_t routeDecayWindow;
+    uint32_t stickyScoreThreshold;
+    uint32_t p2cStride;
+    std::vector<uint32_t> wrrWeights;
+    std::vector<uint32_t> wrrCredits;
+    bool logOneOfNStats;
+
+    int groupIndex(Gicv3::GroupId group) const;
+    int nextScanStart(Gicv3::GroupId group, int numThreads) const;
+    uint64_t candidateScore(const RouteCandidate &c) const;
+    std::vector<RouteCandidate> collect1ofNCandidates(
+        Gicv3::GroupId group, int scanStart);
+    const RouteCandidate *findCandidateByCpu(
+        const std::vector<RouteCandidate> &candidates, int cpu) const;
+    const RouteCandidate *choose1ofNTarget(
+        uint32_t int_id, Gicv3::GroupId group,
+        const std::vector<RouteCandidate> &candidates);
+    const RouteCandidate *chooseLeastLoadCandidate(
+        const std::vector<RouteCandidate> &candidates) const;
+    const char *algoName(OneOfNRouteAlgo algo) const;
+    OneOfNRouteAlgo parseAlgoMode() const;
+    void updateRouteBookkeeping(
+        uint32_t int_id, Gicv3::GroupId group,
+        const RouteCandidate *chosen, size_t candidateCount);
+    void maybeDecayRecentRouteWindow();
+    void maybeInitWrrState(size_t ncpus);
+    const RouteCandidate *chooseWeightedRoundRobin(
+        const std::vector<RouteCandidate> &candidates);
+    void dumpOneOfNStats(const char *reason) const;
 
     bool Log_observation;
 

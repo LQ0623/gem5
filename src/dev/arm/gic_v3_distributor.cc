@@ -41,6 +41,9 @@
 #include "dev/arm/gic_v3_distributor.hh"
 
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
+#include <sstream>
 
 #include "base/compiler.hh"
 #include "base/intmath.hh"
@@ -92,10 +95,26 @@ Gicv3Distributor::Gicv3Distributor(Gicv3 * gic, uint32_t it_lines)
       gicdPidr2(gic->params().gicv4 ? 0x4b : 0x3b),
       gicdPidr3(0),
       gicdPidr4(0x44),
+      oneOfNRouteAlgo(OneOfNRouteAlgo::FirstFit),
       enable1ofNRR(gic->params().enable_1ofn_rr),
       enable1ofNBusyAware(gic->params().enable_1ofn_busy),
-      rrCursor1ofN(-1), // <--- 鍒濆鍖栦负 -1
+      rrCursor1ofN({-1, -1, -1}),
       lastRoutedCpu(it_lines, -1),
+      cpuRouteSelectCount(gic->getSystem()->threads.size(), 0),
+      recentRouteCountWindow(gic->getSystem()->threads.size(), 0),
+      routeCallsByGroup({0, 0, 0}),
+      totalRouteCalls1ofN(0),
+      totalScanLength1ofN(0),
+      totalCandidateCount1ofN(0),
+      busyHitCount1ofN(0),
+      routeSwitchCount1ofN(0),
+      routeDecayWindow(std::max<uint32_t>(
+          1, gic->params().one_of_n_route_decay_window)),
+      stickyScoreThreshold(gic->params().one_of_n_sticky_threshold),
+      p2cStride(std::max<uint32_t>(1, gic->params().one_of_n_p2c_stride)),
+      wrrWeights(),
+      wrrCredits(),
+      logOneOfNStats(gic->params().one_of_n_log_stats),
       Log_observation(gic->params().log_observation),
       setspiWrites(0),
       clrspiWrites(0),
@@ -149,6 +168,26 @@ Gicv3Distributor::Gicv3Distributor(Gicv3 * gic, uint32_t it_lines)
         DS = false;
     } else {
         DS = true;
+    }
+
+    oneOfNRouteAlgo = parseAlgoMode();
+
+    const std::string weight_str = gic->params().one_of_n_wrr_weights;
+    if (!weight_str.empty()) {
+        std::stringstream ss(weight_str);
+        std::string token;
+        while (std::getline(ss, token, ',')) {
+            token.erase(std::remove_if(token.begin(), token.end(),
+                [](unsigned char c) { return std::isspace(c); }),
+                token.end());
+            if (token.empty()) {
+                continue;
+            }
+            const long v = std::strtol(token.c_str(), nullptr, 10);
+            if (v > 0) {
+                wrrWeights.push_back(static_cast<uint32_t>(v));
+            }
+        }
     }
 }
 
@@ -1142,105 +1181,412 @@ Gicv3Distributor::deassertSPI(uint32_t int_id)
 }
 }
 
+int
+Gicv3Distributor::groupIndex(Gicv3::GroupId group) const
+{
+    switch (group) {
+      case Gicv3::G0S:  return 0;
+      case Gicv3::G1S:  return 1;
+      case Gicv3::G1NS: return 2;
+      default:          return 2;
+    }
+}
+
+int
+Gicv3Distributor::nextScanStart(Gicv3::GroupId group, int numThreads) const
+{
+    if (numThreads <= 0) {
+        return 0;
+    }
+    const int gi = groupIndex(group);
+    const int32_t cursor = rrCursor1ofN[gi];
+    if (cursor < 0) {
+        return 0;
+    }
+    return (cursor + 1) % numThreads;
+}
+
+uint64_t
+Gicv3Distributor::candidateScore(const RouteCandidate &c) const
+{
+    static constexpr uint64_t BusyWeight = 1000000;
+    static constexpr uint64_t PendingWeight = 16;
+    static constexpr uint64_t ActiveWeight = 8;
+    static constexpr uint64_t RecentWeight = 1;
+
+    return (c.busy ? BusyWeight : 0) +
+           PendingWeight * c.pendingCount +
+           ActiveWeight * c.activeCount +
+           RecentWeight * c.recentRouteCount;
+}
+
+std::vector<Gicv3Distributor::RouteCandidate>
+Gicv3Distributor::collect1ofNCandidates(Gicv3::GroupId group, int scanStart)
+{
+    std::vector<RouteCandidate> candidates;
+    const int n = gic->getSystem()->threads.size();
+    if (n <= 0) {
+        return candidates;
+    }
+
+    for (int k = 0; k < n; k++) {
+        const int i = (scanStart + k) % n;
+        totalScanLength1ofN++;
+
+        auto *rd = gic->getRedistributor(i);
+        if (!rd) {
+            continue;
+        }
+
+        auto *ci = rd->getCPUInterface();
+        if (!ci) {
+            continue;
+        }
+
+        if (!rd->canBeSelectedFor1toNInterrupt(group)) {
+            continue;
+        }
+
+        RouteCandidate c;
+        c.cpuIndex = i;
+        c.scanIndex = k;
+        c.rd = rd;
+        c.ci = ci;
+        c.busy = ci->isBusy(group);
+        c.pendingCount = ci->pendingCountForRouting(group);
+        c.activeCount = ci->activeCountForRouting(group);
+        c.recentRouteCount =
+            i < recentRouteCountWindow.size() ? recentRouteCountWindow[i] : 0;
+        c.score = candidateScore(c);
+        if (c.busy) {
+            busyHitCount1ofN++;
+        }
+        candidates.push_back(c);
+    }
+
+    totalCandidateCount1ofN += candidates.size();
+    return candidates;
+}
+
+const Gicv3Distributor::RouteCandidate *
+Gicv3Distributor::findCandidateByCpu(
+    const std::vector<RouteCandidate> &candidates, int cpu) const
+{
+    if (cpu < 0) {
+        return nullptr;
+    }
+
+    for (const auto &c : candidates) {
+        if (c.cpuIndex == cpu) {
+            return &c;
+        }
+    }
+    return nullptr;
+}
+
+const Gicv3Distributor::RouteCandidate *
+Gicv3Distributor::chooseLeastLoadCandidate(
+    const std::vector<RouteCandidate> &candidates) const
+{
+    if (candidates.empty()) {
+        return nullptr;
+    }
+
+    const RouteCandidate *best = &candidates.front();
+    for (const auto &c : candidates) {
+        if (c.score < best->score ||
+            (c.score == best->score && c.scanIndex < best->scanIndex) ||
+            (c.score == best->score && c.scanIndex == best->scanIndex &&
+             c.cpuIndex < best->cpuIndex)) {
+            best = &c;
+        }
+    }
+    return best;
+}
+
+void
+Gicv3Distributor::maybeInitWrrState(size_t ncpus)
+{
+    if (ncpus == 0) {
+        return;
+    }
+
+    if (wrrWeights.size() < ncpus) {
+        wrrWeights.resize(ncpus, 1);
+    }
+    if (wrrCredits.size() != ncpus) {
+        wrrCredits = wrrWeights;
+    }
+}
+
+const Gicv3Distributor::RouteCandidate *
+Gicv3Distributor::chooseWeightedRoundRobin(
+    const std::vector<RouteCandidate> &candidates)
+{
+    if (candidates.empty()) {
+        return nullptr;
+    }
+
+    maybeInitWrrState(cpuRouteSelectCount.size());
+
+    for (const auto &c : candidates) {
+        if (c.cpuIndex >= 0 && c.cpuIndex < wrrCredits.size() &&
+            wrrCredits[c.cpuIndex] > 0) {
+            wrrCredits[c.cpuIndex]--;
+            return &c;
+        }
+    }
+
+    // Current WRR round is exhausted: refill credits and retry.
+    wrrCredits = wrrWeights;
+    for (const auto &c : candidates) {
+        if (c.cpuIndex >= 0 && c.cpuIndex < wrrCredits.size() &&
+            wrrCredits[c.cpuIndex] > 0) {
+            wrrCredits[c.cpuIndex]--;
+            return &c;
+        }
+    }
+
+    return &candidates.front();
+}
+
+const Gicv3Distributor::RouteCandidate *
+Gicv3Distributor::choose1ofNTarget(
+    uint32_t int_id, Gicv3::GroupId group,
+    const std::vector<RouteCandidate> &candidates)
+{
+    if (candidates.empty()) {
+        return nullptr;
+    }
+
+    switch (oneOfNRouteAlgo) {
+      case OneOfNRouteAlgo::FirstFit:
+      case OneOfNRouteAlgo::RoundRobin:
+        return &candidates.front();
+
+      case OneOfNRouteAlgo::BusyAwareRoundRobin:
+        for (const auto &c : candidates) {
+            if (!c.busy) {
+                return &c;
+            }
+        }
+        return &candidates.front();
+
+      case OneOfNRouteAlgo::LeastLoad:
+        return chooseLeastLoadCandidate(candidates);
+
+      case OneOfNRouteAlgo::PowerOfTwoChoices: {
+        const size_t n = candidates.size();
+        if (n == 1) {
+            return &candidates.front();
+        }
+        const int gi = groupIndex(group);
+        const int32_t cursor = rrCursor1ofN[gi];
+        const size_t base = ((cursor < 0 ? 0 : (cursor + 1)) % n);
+        size_t idx_a = base;
+        size_t idx_b = (base + (p2cStride % n)) % n;
+        if (idx_a == idx_b && n > 1) {
+            idx_b = (idx_b + 1) % n;
+        }
+        const auto &a = candidates[idx_a];
+        const auto &b = candidates[idx_b];
+        if (a.score < b.score) {
+            return &a;
+        } else if (b.score < a.score) {
+            return &b;
+        } else {
+            return (a.scanIndex <= b.scanIndex) ? &a : &b;
+        }
+      }
+
+      case OneOfNRouteAlgo::StickyLoadAware: {
+        const auto *best = chooseLeastLoadCandidate(candidates);
+        const int sticky_cpu =
+            int_id < lastRoutedCpu.size() ? lastRoutedCpu[int_id] : -1;
+        const auto *sticky = findCandidateByCpu(candidates, sticky_cpu);
+        if (best && sticky &&
+            sticky->score <= best->score + stickyScoreThreshold) {
+            return sticky;
+        }
+        return best;
+      }
+
+      case OneOfNRouteAlgo::WeightedRoundRobin:
+        return chooseWeightedRoundRobin(candidates);
+    }
+
+    return &candidates.front();
+}
+
+void
+Gicv3Distributor::maybeDecayRecentRouteWindow()
+{
+    if (routeDecayWindow == 0 || totalRouteCalls1ofN == 0 ||
+        (totalRouteCalls1ofN % routeDecayWindow) != 0) {
+        return;
+    }
+    for (auto &v : recentRouteCountWindow) {
+        v >>= 1;
+    }
+}
+
+void
+Gicv3Distributor::updateRouteBookkeeping(
+    uint32_t int_id, Gicv3::GroupId group, const RouteCandidate *chosen,
+    size_t candidateCount)
+{
+    totalRouteCalls1ofN++;
+    routeCallsByGroup[groupIndex(group)]++;
+
+    if (!chosen) {
+        maybeDecayRecentRouteWindow();
+        return;
+    }
+
+    rrCursor1ofN[groupIndex(group)] = chosen->cpuIndex;
+    if (chosen->cpuIndex >= 0 &&
+        chosen->cpuIndex < cpuRouteSelectCount.size()) {
+        cpuRouteSelectCount[chosen->cpuIndex]++;
+        recentRouteCountWindow[chosen->cpuIndex]++;
+    }
+
+    if (int_id < lastRoutedCpu.size()) {
+        const int32_t prev = lastRoutedCpu[int_id];
+        if (prev >= 0 && prev != chosen->cpuIndex) {
+            routeSwitchCount1ofN++;
+        }
+        lastRoutedCpu[int_id] = chosen->cpuIndex;
+    }
+
+    DPRINTF(GIC, "1ofN route intid=%u group=%d algo=%s choose_cpu=%d "
+            "scan_len=%zu cand=%zu busy=%d score=%llu\n",
+            int_id, group, algoName(oneOfNRouteAlgo), chosen->cpuIndex,
+            static_cast<size_t>(gic->getSystem()->threads.size()),
+            candidateCount, chosen->busy,
+            static_cast<unsigned long long>(chosen->score));
+
+    maybeDecayRecentRouteWindow();
+}
+
+const char *
+Gicv3Distributor::algoName(OneOfNRouteAlgo algo) const
+{
+    switch (algo) {
+      case OneOfNRouteAlgo::FirstFit: return "first_fit";
+      case OneOfNRouteAlgo::RoundRobin: return "round_robin";
+      case OneOfNRouteAlgo::BusyAwareRoundRobin: return "busy_rr";
+      case OneOfNRouteAlgo::LeastLoad: return "least_load";
+      case OneOfNRouteAlgo::PowerOfTwoChoices: return "p2c";
+      case OneOfNRouteAlgo::StickyLoadAware: return "sticky_load";
+      case OneOfNRouteAlgo::WeightedRoundRobin: return "wrr";
+    }
+    return "unknown";
+}
+
+Gicv3Distributor::OneOfNRouteAlgo
+Gicv3Distributor::parseAlgoMode() const
+{
+    std::string mode = gic->params().one_of_n_spi_mode;
+    std::transform(mode.begin(), mode.end(), mode.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+
+    if (mode == "legacy" || mode.empty()) {
+        if (enable1ofNBusyAware) {
+            return OneOfNRouteAlgo::BusyAwareRoundRobin;
+        }
+        if (enable1ofNRR) {
+            return OneOfNRouteAlgo::RoundRobin;
+        }
+        return OneOfNRouteAlgo::FirstFit;
+    } else if (mode == "first_fit") {
+        return OneOfNRouteAlgo::FirstFit;
+    } else if (mode == "round_robin" || mode == "rr") {
+        return OneOfNRouteAlgo::RoundRobin;
+    } else if (mode == "busy_rr" || mode == "busy_aware_rr") {
+        return OneOfNRouteAlgo::BusyAwareRoundRobin;
+    } else if (mode == "least_load") {
+        return OneOfNRouteAlgo::LeastLoad;
+    } else if (mode == "p2c" || mode == "power_of_two") {
+        return OneOfNRouteAlgo::PowerOfTwoChoices;
+    } else if (mode == "sticky_load" || mode == "sticky_load_aware") {
+        return OneOfNRouteAlgo::StickyLoadAware;
+    } else if (mode == "wrr" || mode == "weighted_rr") {
+        return OneOfNRouteAlgo::WeightedRoundRobin;
+    }
+
+    warn("Unknown one_of_n_spi_mode='%s', fallback to legacy mapping",
+         gic->params().one_of_n_spi_mode.c_str());
+    if (enable1ofNBusyAware) {
+        return OneOfNRouteAlgo::BusyAwareRoundRobin;
+    }
+    if (enable1ofNRR) {
+        return OneOfNRouteAlgo::RoundRobin;
+    }
+    return OneOfNRouteAlgo::FirstFit;
+}
+
+void
+Gicv3Distributor::dumpOneOfNStats(const char *reason) const
+{
+    if (!logOneOfNStats || totalRouteCalls1ofN == 0) {
+        return;
+    }
+
+    inform("[GIC-1ofN] reason=%s algo=%s calls=%llu scan_avg=%.3f "
+           "cand_avg=%.3f busy_hit=%llu switches=%llu",
+           reason, algoName(oneOfNRouteAlgo),
+           static_cast<unsigned long long>(totalRouteCalls1ofN),
+           totalRouteCalls1ofN ?
+               static_cast<double>(totalScanLength1ofN) / totalRouteCalls1ofN :
+               0.0,
+           totalRouteCalls1ofN ?
+               static_cast<double>(totalCandidateCount1ofN) /
+                   totalRouteCalls1ofN :
+               0.0,
+           static_cast<unsigned long long>(busyHitCount1ofN),
+           static_cast<unsigned long long>(routeSwitchCount1ofN));
+
+    for (size_t i = 0; i < cpuRouteSelectCount.size(); ++i) {
+        inform("[GIC-1ofN] cpu=%zu selected=%llu recent=%u", i,
+               static_cast<unsigned long long>(cpuRouteSelectCount[i]),
+               i < recentRouteCountWindow.size() ?
+                   recentRouteCountWindow[i] : 0);
+    }
+}
+
+Gicv3Distributor::~Gicv3Distributor()
+{
+    dumpOneOfNStats("destructor");
+}
+
 Gicv3CPUInterface*
 Gicv3Distributor::route(uint32_t int_id)
 {
     IROUTER affinity_routing = irqAffinityRouting[int_id];
-    Gicv3Redistributor * target_redistributor = nullptr;
-
     const Gicv3::GroupId int_group = getIntGroup(int_id);
+    Gicv3Redistributor * target_redistributor = nullptr;
+    Gicv3CPUInterface *target_cpu_interface = nullptr;
 
     if (affinity_routing.IRM) {
-        // Interrupts routed to any PE defined as a participating node
-        // for (int i = 0; i < gic->getSystem()->threads.size(); i++) {
-        //     Gicv3Redistributor * redistributor_i =
-        //         gic->getRedistributor(i);
-
-        //     if (redistributor_i->
-        //             canBeSelectedFor1toNInterrupt(int_group)) {
-        //         target_redistributor = redistributor_i;
-        //         break;
-        //     }
-        // }
         const int n = gic->getSystem()->threads.size();
-        if (n == 0) return nullptr;
-        int start = (rrCursor1ofN + 1) % n;
-        int chosen = -1;  // Initialize to invalid to detect if none found
-        if(enable1ofNBusyAware) {
-            for (int k = 0; k < n; k++) {  // Start from 0 to cover exactly n iterations
-                int i = (start + k) % n;
-                auto *rd = gic->getRedistributor(i);
-                auto *ci = rd->getCPUInterface();
-                DPRINTF(GIC, "1ofN probe i=%d group=%d selectable=%d busy=%d\n",
-                        i, int_group,
-                        rd->canBeSelectedFor1toNInterrupt(int_group),
-                        ci ? ci->isBusy(int_group) : -1);
-
-                if (ci && ci->isBusy(int_group)) continue;
-
-                if (!rd || !rd->canBeSelectedFor1toNInterrupt(int_group)) continue;
-
-                target_redistributor = rd;
-                chosen = i;
-                break;
-            }
-            if (!target_redistributor) {
-                for (int k = 0; k < n; k++) {  // Start from 0 to cover exactly n iterations
-                    int i = (start + k) % n;
-                    auto *rd = gic->getRedistributor(i);
-                    if (rd && rd->canBeSelectedFor1toNInterrupt(int_group)) {
-                        target_redistributor = rd;
-                        chosen = i;
-                        break;
-                    }
-                }
-            }
-
-            if(!target_redistributor) {
-                // No participating node -> keep pending
-                DPRINTF(GIC, "1ofN: no target found (all non-participating)\n");
-                return nullptr;
-            }
-
-            // Update rrCursor1ofN for the next round
-            rrCursor1ofN = chosen;
-            lastRoutedCpu[int_id] = chosen;
-
-            DPRINTF(GIC, "1ofN choose PE index=%d (rrCursor=%d)\n", chosen, rrCursor1ofN);
-        } else if(enable1ofNRR) {
-            for (int k = 0; k < n; k++) {  // Start from 0 to cover exactly n iterations
-                int i = (start + k) % n;
-                auto *rd = gic->getRedistributor(i);
-                if (rd && rd->canBeSelectedFor1toNInterrupt(int_group)) {
-                    target_redistributor = rd;
-                    chosen = i;
-                    break;
-                }
-            }
-            if (!target_redistributor) {
-                return nullptr;
-            }
-            // Update rrCursor1ofN for the next round
-            rrCursor1ofN = chosen;
-
-            DPRINTF(GIC, "rrCursor1ofN=%d, n = %d\n",
-                    rrCursor1ofN, n);
-        } else {
-
-            for (int i = 0; i < gic->getSystem()->threads.size(); i++) {
-                Gicv3Redistributor * redistributor_i =
-                    gic->getRedistributor(i);
-
-                if (redistributor_i->
-                        canBeSelectedFor1toNInterrupt(int_group)) {
-                    rrCursor1ofN = i;
-                    target_redistributor = redistributor_i;
-                    break;
-                }
-            }
-            DPRINTF(GIC, "select cpu is %d, n = %d\n",
-                    rrCursor1ofN, n);
+        if (n <= 0) {
+            return nullptr;
         }
+
+        maybeInitWrrState(n);
+        const int scan_start = (oneOfNRouteAlgo == OneOfNRouteAlgo::FirstFit) ?
+            0 : nextScanStart(int_group, n);
+        auto candidates = collect1ofNCandidates(int_group, scan_start);
+        const auto *chosen = choose1ofNTarget(int_id, int_group, candidates);
+        updateRouteBookkeeping(int_id, int_group, chosen, candidates.size());
+        if (!chosen) {
+            DPRINTF(GIC, "1ofN: no selectable redistributor (group=%d)\n",
+                    int_group);
+            return nullptr;
+        }
+
+        target_redistributor = chosen->rd;
+        target_cpu_interface = chosen->ci;
 
     } else {
         uint32_t affinity = (affinity_routing.Aff3 << 24) |
@@ -1251,39 +1597,56 @@ Gicv3Distributor::route(uint32_t int_id)
             gic->getRedistributorByAffinity(affinity);
         DPRINTF(GIC, "IRM = 0, affinity=%d\n",
                 affinity);
+        if (target_redistributor) {
+            target_cpu_interface = target_redistributor->getCPUInterface();
+        }
     }
 
-    if (!target_redistributor) {
+    if (!target_redistributor || !target_cpu_interface) {
         // Interrrupts targeting not present cpus must remain pending
         return nullptr;
-    } else {
-        return target_redistributor->getCPUInterface();
     }
+
+    // 即使是 IRM=0，也更新最近路由 CPU，供 clearIrqCpuInterface 回溯。
+    if (int_id < lastRoutedCpu.size()) {
+        const int n = gic->getSystem()->threads.size();
+        for (int i = 0; i < n; i++) {
+            if (gic->getRedistributor(i) == target_redistributor) {
+                lastRoutedCpu[int_id] = i;
+                break;
+            }
+        }
+    }
+
+    return target_cpu_interface;
 }
 
 void
 Gicv3Distributor::clearIrqCpuInterface(uint32_t int_id)
 {
     int idx = (int_id < lastRoutedCpu.size()) ? lastRoutedCpu[int_id] : -1;
-    if (idx >= 0) {
-        auto *ci = gic->getRedistributor(idx)->getCPUInterface();
-        if (ci) ci->resetHppi(int_id);
+    const int n = gic->getSystem()->threads.size();
+    if (idx >= 0 && idx < n) {
+        auto *rd = gic->getRedistributor(idx);
+        auto *ci = rd ? rd->getCPUInterface() : nullptr;
+        if (ci) {
+            ci->resetHppi(int_id);
+        }
     } else {
-        // fallback锛氬鏋滀粠鏈矾鐢辫繃锛屽啀 route 涓€娆★紙寰堝皯鍙戠敓锛?
+        // Fallback: if this interrupt has never been routed, try once here.
         auto *ci = route(int_id);
-        if (ci) ci->resetHppi(int_id);
+        if (ci) {
+            ci->resetHppi(int_id);
+        }
     }
-    // auto cpu_interface = route(int_id);
-    // if (cpu_interface)
-    //     cpu_interface->resetHppi(int_id);
 }
 
 void
 Gicv3Distributor::update()
 {
-    int target_id;
-    Gicv3::GroupId target_group;
     updateCalls++;
+    int selected_intid = -1;
+    Gicv3::GroupId selected_group = Gicv3::G1NS;
 
     DPRINTF(GIC, "DIST update() begin\n");
 
@@ -1312,13 +1675,19 @@ Gicv3Distributor::update()
                 target_cpu_interface->hppi.intid = int_id;
                 target_cpu_interface->hppi.prio = irqPriority[int_id];
                 target_cpu_interface->hppi.group = int_group;
+                selected_intid = int_id;
+                selected_group = int_group;
             }
         }
     }
 
-    // 鍦ㄤ綘鈥滅‘璁ゆ煇涓?intid 琚€変负鏈€楂樹紭鍏堢骇鈥濋偅涓€鍒绘墦鍗帮細
-    DPRINTF(GIC, "DIST select intid=%u prio=%u group=%u targetCpu=%d\n",
-            target_id, irqPriority[target_id], target_group, lastRoutedCpu[target_id]); // 鑻ユ病鏈?lastRoutedCpu锛屽氨鎵撳嵃 route() 寰楀埌鐨?idx
+    if (selected_intid >= 0) {
+        const int target_cpu = selected_intid < lastRoutedCpu.size() ?
+            lastRoutedCpu[selected_intid] : -1;
+        DPRINTF(GIC, "DIST select intid=%u prio=%u group=%u targetCpu=%d\n",
+                selected_intid, irqPriority[selected_intid], selected_group,
+                target_cpu);
+    }
 
     DPRINTF(GIC, "DIST update() end\n");
 
@@ -1415,6 +1784,7 @@ Gicv3Distributor::copy(Gicv3Registers *from, Gicv3Registers *to)
 void
 Gicv3Distributor::serialize(CheckpointOut & cp) const
 {
+    dumpOneOfNStats("serialize");
     SERIALIZE_SCALAR(ARE);
     SERIALIZE_SCALAR(DS);
     SERIALIZE_SCALAR(EnableGrp1S);
@@ -1430,7 +1800,25 @@ Gicv3Distributor::serialize(CheckpointOut & cp) const
     SERIALIZE_CONTAINER(irqGrpmod);
     SERIALIZE_CONTAINER(irqNsacr);
     SERIALIZE_CONTAINER(irqAffinityRouting);
-    SERIALIZE_SCALAR(rrCursor1ofN); // <--- 淇濆瓨鐘舵€?
+    std::vector<int32_t> rr_cursor_vec(rrCursor1ofN.begin(),
+                                        rrCursor1ofN.end());
+    SERIALIZE_CONTAINER(rr_cursor_vec);
+    SERIALIZE_CONTAINER(lastRoutedCpu);
+    SERIALIZE_CONTAINER(cpuRouteSelectCount);
+    SERIALIZE_CONTAINER(recentRouteCountWindow);
+    std::vector<uint64_t> route_calls_vec(
+        routeCallsByGroup.begin(), routeCallsByGroup.end());
+    SERIALIZE_CONTAINER(route_calls_vec);
+    SERIALIZE_SCALAR(totalRouteCalls1ofN);
+    SERIALIZE_SCALAR(totalScanLength1ofN);
+    SERIALIZE_SCALAR(totalCandidateCount1ofN);
+    SERIALIZE_SCALAR(busyHitCount1ofN);
+    SERIALIZE_SCALAR(routeSwitchCount1ofN);
+    SERIALIZE_SCALAR(routeDecayWindow);
+    SERIALIZE_SCALAR(stickyScoreThreshold);
+    SERIALIZE_SCALAR(p2cStride);
+    SERIALIZE_CONTAINER(wrrWeights);
+    SERIALIZE_CONTAINER(wrrCredits);
 }
 
 void
@@ -1451,7 +1839,30 @@ Gicv3Distributor::unserialize(CheckpointIn & cp)
     UNSERIALIZE_CONTAINER(irqGrpmod);
     UNSERIALIZE_CONTAINER(irqNsacr);
     UNSERIALIZE_CONTAINER(irqAffinityRouting);
-    UNSERIALIZE_SCALAR(rrCursor1ofN); // <--- 鎭㈠鐘舵€?
+    std::vector<int32_t> rr_cursor_vec;
+    UNSERIALIZE_CONTAINER(rr_cursor_vec);
+    for (size_t i = 0; i < rrCursor1ofN.size(); ++i) {
+        rrCursor1ofN[i] = i < rr_cursor_vec.size() ? rr_cursor_vec[i] : -1;
+    }
+    UNSERIALIZE_CONTAINER(lastRoutedCpu);
+    UNSERIALIZE_CONTAINER(cpuRouteSelectCount);
+    UNSERIALIZE_CONTAINER(recentRouteCountWindow);
+    std::vector<uint64_t> route_calls_vec;
+    UNSERIALIZE_CONTAINER(route_calls_vec);
+    for (size_t i = 0; i < routeCallsByGroup.size(); ++i) {
+        routeCallsByGroup[i] = i < route_calls_vec.size() ?
+            route_calls_vec[i] : 0;
+    }
+    UNSERIALIZE_SCALAR(totalRouteCalls1ofN);
+    UNSERIALIZE_SCALAR(totalScanLength1ofN);
+    UNSERIALIZE_SCALAR(totalCandidateCount1ofN);
+    UNSERIALIZE_SCALAR(busyHitCount1ofN);
+    UNSERIALIZE_SCALAR(routeSwitchCount1ofN);
+    UNSERIALIZE_SCALAR(routeDecayWindow);
+    UNSERIALIZE_SCALAR(stickyScoreThreshold);
+    UNSERIALIZE_SCALAR(p2cStride);
+    UNSERIALIZE_CONTAINER(wrrWeights);
+    UNSERIALIZE_CONTAINER(wrrCredits);
 }
 
 } // namespace gem5

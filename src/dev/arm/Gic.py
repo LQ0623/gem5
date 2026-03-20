@@ -317,9 +317,41 @@ class Gicv3(BaseGic):
 
     gicv4 = Param.Bool(False, "GIC is GICv4 compatible")
 
+    one_of_n_spi_mode = Param.String(
+        "legacy",
+        "SPI 1-of-N routing mode: "
+        "legacy|first_fit|round_robin|busy_rr|least_load|p2c|sticky_load|wrr",
+    )
+
     enable_1ofn_rr = Param.Bool(False, "Using a polling algorithm")
 
     enable_1ofn_busy = Param.Bool(False, "Use busy-active selection")
+
+    one_of_n_route_decay_window = Param.UInt32(
+        64,
+        "Route-count decay period for recent-route window statistics",
+    )
+
+    one_of_n_sticky_threshold = Param.UInt32(
+        3,
+        "Sticky+Load-Aware score tolerance: keep sticky target when "
+        "sticky_score <= best_score + threshold",
+    )
+
+    one_of_n_p2c_stride = Param.UInt32(
+        3,
+        "Deterministic stride used by P2C candidate sampling",
+    )
+
+    one_of_n_wrr_weights = Param.String(
+        "",
+        "Comma-separated WRR weights per CPU, e.g. '4,4,2,1'",
+    )
+
+    one_of_n_log_stats = Param.Bool(
+        False,
+        "Print 1-of-N route statistics summary at simulation teardown",
+    )
 
     log_observation = Param.Bool(
         False, "Log GICD MMIO read/write for observation"
