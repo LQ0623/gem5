@@ -53,6 +53,8 @@
 namespace gem5
 {
 
+class OutputStream;
+
 class Gicv3Distributor : public Serializable
 {
   private:
@@ -320,6 +322,20 @@ class Gicv3Distributor : public Serializable
         uint64_t score = 0;
     };
 
+    struct TraceSnapshot
+    {
+        bool valid = false;
+        uint64_t tick = 0;
+        int cpuIndex = -1;
+        bool busy = false;
+        uint32_t pendingCount = 0;
+        uint32_t activeCount = 0;
+        uint32_t recentRouteCount = 0;
+        uint64_t score = 0;
+        uint64_t candidateCount = 0;
+        uint64_t scanCount = 0;
+    };
+
     OneOfNRouteAlgo oneOfNRouteAlgo;
     bool enable1ofNRR;
     bool enable1ofNBusyAware;
@@ -343,11 +359,18 @@ class Gicv3Distributor : public Serializable
     uint32_t p2cStride;
     std::vector<uint32_t> wrrWeights;
     std::vector<uint32_t> wrrCredits;
+    std::vector<bool> oneOfNCpuEligible;
+    std::vector<TraceSnapshot> pendingTraceSnapshots;
+    std::vector<bool> pendingTraceLogged;
+    std::vector<std::string> oneOfNTraceLines;
+    OutputStream *oneOfNTraceFile;
     bool logOneOfNStats;
+    bool traceOneOfNEvents;
 
     int groupIndex(Gicv3::GroupId group) const;
     int nextScanStart(Gicv3::GroupId group, int numThreads) const;
     uint64_t candidateScore(const RouteCandidate &c) const;
+    bool cpuEligibleFor1ofN(int cpu) const;
     std::vector<RouteCandidate> collect1ofNCandidates(
         Gicv3::GroupId group, int scanStart);
     const RouteCandidate *findCandidateByCpu(
@@ -367,6 +390,7 @@ class Gicv3Distributor : public Serializable
     const RouteCandidate *chooseWeightedRoundRobin(
         const std::vector<RouteCandidate> &candidates);
     void dumpOneOfNStats(const char *reason) const;
+    void dumpOneOfNTrace();
 
     bool Log_observation;
 

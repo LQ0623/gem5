@@ -47,11 +47,14 @@
 
 #include "base/compiler.hh"
 #include "base/intmath.hh"
+#include "base/logging.hh"
+#include "base/output.hh"
 #include "debug/GIC.hh"
 #include "dev/arm/gic_v3.hh"
 #include "dev/arm/gic_v3_cpu_interface.hh"
 #include "dev/arm/gic_v3_its.hh"
 #include "dev/arm/gic_v3_redistributor.hh"
+#include "sim/cur_tick.hh"
 
 namespace gem5
 {
@@ -114,7 +117,13 @@ Gicv3Distributor::Gicv3Distributor(Gicv3 * gic, uint32_t it_lines)
       p2cStride(std::max<uint32_t>(1, gic->params().one_of_n_p2c_stride)),
       wrrWeights(),
       wrrCredits(),
+      oneOfNCpuEligible(gic->getSystem()->threads.size(), true),
+      pendingTraceSnapshots(it_lines),
+      pendingTraceLogged(it_lines, false),
+      oneOfNTraceLines(),
+      oneOfNTraceFile(nullptr),
       logOneOfNStats(gic->params().one_of_n_log_stats),
+      traceOneOfNEvents(gic->params().one_of_n_trace_enable),
       Log_observation(gic->params().log_observation),
       setspiWrites(0),
       clrspiWrites(0),
@@ -186,6 +195,27 @@ Gicv3Distributor::Gicv3Distributor(Gicv3 * gic, uint32_t it_lines)
             const long v = std::strtol(token.c_str(), nullptr, 10);
             if (v > 0) {
                 wrrWeights.push_back(static_cast<uint32_t>(v));
+            }
+        }
+    }
+
+    const std::string include_str = gic->params().one_of_n_cpu_include;
+    if (!include_str.empty() && !oneOfNCpuEligible.empty()) {
+        std::fill(oneOfNCpuEligible.begin(), oneOfNCpuEligible.end(), false);
+        std::stringstream ss(include_str);
+        std::string token;
+        while (std::getline(ss, token, ',')) {
+            token.erase(std::remove_if(token.begin(), token.end(),
+                [](unsigned char c) { return std::isspace(c); }),
+                token.end());
+            if (token.empty()) {
+                continue;
+            }
+
+            const long cpu = std::strtol(token.c_str(), nullptr, 10);
+            if (cpu >= 0 &&
+                static_cast<size_t>(cpu) < oneOfNCpuEligible.size()) {
+                oneOfNCpuEligible[static_cast<size_t>(cpu)] = true;
             }
         }
     }
@@ -1145,6 +1175,10 @@ Gicv3Distributor::sendInt(uint32_t int_id)
     panic_if(int_id > itLines, "Invalid SPI!");
     irqPending[int_id] = true;
     irqPendingIspendr[int_id] = false;
+    if (int_id < pendingTraceSnapshots.size()) {
+        pendingTraceSnapshots[int_id] = TraceSnapshot();
+        pendingTraceLogged[int_id] = false;
+    }
     DPRINTF(GIC, "Gicv3Distributor::sendInt(): "
             "int_id %d (SPI) pending bit set\n", int_id);
     update();
@@ -1171,6 +1205,10 @@ Gicv3Distributor::deassertSPI(uint32_t int_id)
     panic_if(int_id < Gicv3::SGI_MAX + Gicv3::PPI_MAX, "Invalid SPI!");
     panic_if(int_id > itLines, "Invalid SPI!");
     irqPending[int_id] = false;
+    if (int_id < pendingTraceSnapshots.size()) {
+        pendingTraceSnapshots[int_id] = TraceSnapshot();
+        pendingTraceLogged[int_id] = false;
+    }
     clearIrqCpuInterface(int_id);
 
     update();
@@ -1220,6 +1258,21 @@ Gicv3Distributor::candidateScore(const RouteCandidate &c) const
            RecentWeight * c.recentRouteCount;
 }
 
+bool
+Gicv3Distributor::cpuEligibleFor1ofN(int cpu) const
+{
+    if (cpu < 0) {
+        return false;
+    }
+
+    if (oneOfNCpuEligible.empty()) {
+        return true;
+    }
+
+    return static_cast<size_t>(cpu) < oneOfNCpuEligible.size() ?
+        oneOfNCpuEligible[static_cast<size_t>(cpu)] : false;
+}
+
 std::vector<Gicv3Distributor::RouteCandidate>
 Gicv3Distributor::collect1ofNCandidates(Gicv3::GroupId group, int scanStart)
 {
@@ -1232,6 +1285,10 @@ Gicv3Distributor::collect1ofNCandidates(Gicv3::GroupId group, int scanStart)
     for (int k = 0; k < n; k++) {
         const int i = (scanStart + k) % n;
         totalScanLength1ofN++;
+
+        if (!cpuEligibleFor1ofN(i)) {
+            continue;
+        }
 
         auto *rd = gic->getRedistributor(i);
         if (!rd) {
@@ -1556,7 +1613,33 @@ Gicv3Distributor::dumpOneOfNStats(const char *reason) const
 
 Gicv3Distributor::~Gicv3Distributor()
 {
+    dumpOneOfNTrace();
     dumpOneOfNStats("destructor");
+}
+
+void
+Gicv3Distributor::dumpOneOfNTrace()
+{
+    if (!traceOneOfNEvents || oneOfNTraceLines.empty()) {
+        return;
+    }
+
+    if (!oneOfNTraceFile) {
+        oneOfNTraceFile = simout.create("gic1n_trace.log", false, true);
+    }
+
+    auto *stream = oneOfNTraceFile ? oneOfNTraceFile->stream() : nullptr;
+    if (!stream) {
+        return;
+    }
+
+    for (const auto &line : oneOfNTraceLines) {
+        (*stream) << line << '\n';
+    }
+    stream->flush();
+    simout.close(oneOfNTraceFile);
+    oneOfNTraceFile = nullptr;
+    oneOfNTraceLines.clear();
 }
 
 Gicv3CPUInterface*
@@ -1566,6 +1649,12 @@ Gicv3Distributor::route(uint32_t int_id)
     const Gicv3::GroupId int_group = getIntGroup(int_id);
     Gicv3Redistributor * target_redistributor = nullptr;
     Gicv3CPUInterface *target_cpu_interface = nullptr;
+    RouteCandidate traceCandidate;
+    bool haveTraceCandidate = false;
+    size_t candidateCount = 0;
+    size_t scanCount = 1;
+    const char *tracePolicy = affinity_routing.IRM ?
+        algoName(oneOfNRouteAlgo) : "fixed_target";
 
     if (affinity_routing.IRM) {
         const int n = gic->getSystem()->threads.size();
@@ -1579,12 +1668,16 @@ Gicv3Distributor::route(uint32_t int_id)
         auto candidates = collect1ofNCandidates(int_group, scan_start);
         const auto *chosen = choose1ofNTarget(int_id, int_group, candidates);
         updateRouteBookkeeping(int_id, int_group, chosen, candidates.size());
+        candidateCount = candidates.size();
+        scanCount = n;
         if (!chosen) {
             DPRINTF(GIC, "1ofN: no selectable redistributor (group=%d)\n",
                     int_group);
             return nullptr;
         }
 
+        traceCandidate = *chosen;
+        haveTraceCandidate = true;
         target_redistributor = chosen->rd;
         target_cpu_interface = chosen->ci;
 
@@ -1599,6 +1692,31 @@ Gicv3Distributor::route(uint32_t int_id)
                 affinity);
         if (target_redistributor) {
             target_cpu_interface = target_redistributor->getCPUInterface();
+        }
+
+        if (target_redistributor && target_cpu_interface) {
+            const int n = gic->getSystem()->threads.size();
+            for (int i = 0; i < n; i++) {
+                if (gic->getRedistributor(i) != target_redistributor) {
+                    continue;
+                }
+                traceCandidate.cpuIndex = i;
+                traceCandidate.rd = target_redistributor;
+                traceCandidate.ci = target_cpu_interface;
+                traceCandidate.busy = target_cpu_interface->isBusy(int_group);
+                traceCandidate.pendingCount =
+                    target_cpu_interface->pendingCountForRouting(int_group);
+                traceCandidate.activeCount =
+                    target_cpu_interface->activeCountForRouting(int_group);
+                traceCandidate.recentRouteCount =
+                    i < recentRouteCountWindow.size() ?
+                        recentRouteCountWindow[i] : 0;
+                traceCandidate.score = candidateScore(traceCandidate);
+                candidateCount = 1;
+                scanCount = 1;
+                haveTraceCandidate = true;
+                break;
+            }
         }
     }
 
@@ -1616,6 +1734,23 @@ Gicv3Distributor::route(uint32_t int_id)
                 break;
             }
         }
+    }
+
+    if (traceOneOfNEvents && haveTraceCandidate &&
+        int_id >= (Gicv3::SGI_MAX + Gicv3::PPI_MAX) &&
+        int_id < Gicv3::INTID_SECURE &&
+        int_id < pendingTraceSnapshots.size()) {
+        auto &snapshot = pendingTraceSnapshots[int_id];
+        snapshot.valid = true;
+        snapshot.tick = curTick();
+        snapshot.cpuIndex = traceCandidate.cpuIndex;
+        snapshot.busy = traceCandidate.busy;
+        snapshot.pendingCount = traceCandidate.pendingCount;
+        snapshot.activeCount = traceCandidate.activeCount;
+        snapshot.recentRouteCount = traceCandidate.recentRouteCount;
+        snapshot.score = traceCandidate.score;
+        snapshot.candidateCount = candidateCount;
+        snapshot.scanCount = scanCount;
     }
 
     return target_cpu_interface;
@@ -1687,6 +1822,48 @@ Gicv3Distributor::update()
         DPRINTF(GIC, "DIST select intid=%u prio=%u group=%u targetCpu=%d\n",
                 selected_intid, irqPriority[selected_intid], selected_group,
                 target_cpu);
+        if (traceOneOfNEvents && selected_intid < Gicv3::INTID_SECURE &&
+            selected_intid < pendingTraceLogged.size() &&
+            !pendingTraceLogged[selected_intid]) {
+            if (selected_intid < pendingTraceSnapshots.size()) {
+                const auto &snapshot = pendingTraceSnapshots[selected_intid];
+                if (snapshot.valid) {
+                  const bool one_of_n =
+                                  rqAffinityRouting[selected_intid].IRM;
+                  std::ostringstream route_line;
+                  route_line
+                   << "[GIC1N_ROUTE] tick="
+                   << static_cast<unsigned long long>(snapshot.tick)
+                   << " intid=" << selected_intid
+                   << " mode=" << (one_of_n ? "1ofn" : "fixed")
+                   << " policy="
+                   << (one_of_n ? algoName(oneOfNRouteAlgo)
+                                       : "fixed_target")
+                   << " target_cpu=" << snapshot.cpuIndex
+                   << " busy_before=" << (snapshot.busy ? 1U : 0U)
+                   << " pending_before=" << snapshot.pendingCount
+                   << " active_before=" << snapshot.activeCount
+                   << " recent_load=" << snapshot.recentRouteCount
+                   << " score="
+                   << static_cast<unsigned long long>(snapshot.score)
+                   << " candidate_count="
+                   << static_cast<unsigned long long>(snapshot.candidateCount)
+                   << " scan_count="
+                   << static_cast<unsigned long long>(snapshot.scanCount);
+                  oneOfNTraceLines.emplace_back(route_line.str());
+                }
+            }
+            std::ostringstream deliver_line;
+            deliver_line
+                << "[GIC1N_DELIVER] tick="
+                << static_cast<unsigned long long>(curTick())
+                << " intid=" << selected_intid
+                << " target_cpu=" << target_cpu
+                << " group=" << static_cast<unsigned>(selected_group)
+                << " prio=" << irqPriority[selected_intid];
+            oneOfNTraceLines.emplace_back(deliver_line.str());
+            pendingTraceLogged[selected_intid] = true;
+        }
     }
 
     DPRINTF(GIC, "DIST update() end\n");
@@ -1748,6 +1925,10 @@ Gicv3Distributor::activateIRQ(uint32_t int_id)
 {
     if (treatAsEdgeTriggered(int_id)) {
         irqPending[int_id] = false;
+        if (int_id < pendingTraceSnapshots.size()) {
+            pendingTraceSnapshots[int_id] = TraceSnapshot();
+            pendingTraceLogged[int_id] = false;
+        }
     }
     irqActive[int_id] = true;
 }

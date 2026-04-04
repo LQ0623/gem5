@@ -353,6 +353,17 @@ class Gicv3(BaseGic):
         "Print 1-of-N route statistics summary at simulation teardown",
     )
 
+    one_of_n_trace_enable = Param.Bool(
+        False,
+        "Emit structured per-interrupt route and deliver trace lines",
+    )
+
+    one_of_n_cpu_include = Param.String(
+        "",
+        "Comma-separated CPU indices eligible for SPI 1-of-N routing. "
+        "Empty means all CPUs are eligible.",
+    )
+
     log_observation = Param.Bool(
         False, "Log GICD MMIO read/write for observation"
     )

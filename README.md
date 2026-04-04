@@ -59,6 +59,26 @@ The main source tree includes these subdirectories:
 * tests: regression tests
 * util: useful utility programs and files
 
+## GIC 1-of-N Experiment Suite
+
+A companion SPI 1-of-N routing evaluation suite is available in this workspace
+at `../tests/gic1-of-n/`.
+
+Run one case:
+
+`cd ../tests/gic1-of-n && python3 scripts/run_case.py --workload hotspot_overload --policy least_load --seed 1 --num-cpus 4 --rate-hz 40000 --simulation-length 1500`
+
+Run a sweep and generate artifacts:
+
+`cd ../tests/gic1-of-n && python3 scripts/sweep.py --skip-existing && python3 scripts/aggregate_results.py && python3 scripts/plot_main_figures.py && python3 scripts/export_tables.py`
+
+Raw latency samples are written per run under
+`../tests/gic1-of-n/results/raw/<workload>/<policy>/.../interrupt_trace.csv`.
+Aggregated CSVs, plots, and tables are written under
+`../tests/gic1-of-n/results/aggregated/`,
+`../tests/gic1-of-n/results/plots/`, and
+`../tests/gic1-of-n/results/tables/`.
+
 ## gem5 Resources
 
 To run full-system simulations, you may need compiled system firmware, kernel
