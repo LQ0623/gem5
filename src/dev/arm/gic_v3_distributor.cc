@@ -111,6 +111,8 @@ Gicv3Distributor::Gicv3Distributor(Gicv3 * gic, uint32_t it_lines)
       totalCandidateCount1ofN(0),
       busyHitCount1ofN(0),
       routeSwitchCount1ofN(0),
+      routeCostDecisionCount1ofN(0),
+      lastRouteCostCpu1ofN(-1),
       routeDecayWindow(std::max<uint32_t>(
           1, gic->params().one_of_n_route_decay_window)),
       stickyScoreThreshold(gic->params().one_of_n_sticky_threshold),
@@ -1653,6 +1655,9 @@ Gicv3Distributor::route(uint32_t int_id)
     bool haveTraceCandidate = false;
     size_t candidateCount = 0;
     size_t scanCount = 1;
+    bool stickyReuse = false;
+    bool stickyFallback = false;
+    const int32_t previousRouteCostCpu = lastRouteCostCpu1ofN;
     const char *tracePolicy = affinity_routing.IRM ?
         algoName(oneOfNRouteAlgo) : "fixed_target";
 
@@ -1666,7 +1671,22 @@ Gicv3Distributor::route(uint32_t int_id)
         const int scan_start = (oneOfNRouteAlgo == OneOfNRouteAlgo::FirstFit) ?
             0 : nextScanStart(int_group, n);
         auto candidates = collect1ofNCandidates(int_group, scan_start);
+        const int32_t previousIntidCpu =
+            int_id < lastRoutedCpu.size() ? lastRoutedCpu[int_id] : -1;
+        const RouteCandidate *stickyBest = nullptr;
+        const RouteCandidate *stickyCandidate = nullptr;
+        if (oneOfNRouteAlgo == OneOfNRouteAlgo::StickyLoadAware) {
+            stickyBest = chooseLeastLoadCandidate(candidates);
+            stickyCandidate = findCandidateByCpu(candidates, previousIntidCpu);
+        }
         const auto *chosen = choose1ofNTarget(int_id, int_group, candidates);
+        if (oneOfNRouteAlgo == OneOfNRouteAlgo::StickyLoadAware && chosen) {
+            stickyReuse = stickyBest && stickyCandidate &&
+                chosen->cpuIndex == stickyCandidate->cpuIndex &&
+                stickyCandidate->score <= stickyBest->score +
+                    stickyScoreThreshold;
+            stickyFallback = !stickyReuse;
+        }
         updateRouteBookkeeping(int_id, int_group, chosen, candidates.size());
         candidateCount = candidates.size();
         scanCount = n;
@@ -1751,6 +1771,39 @@ Gicv3Distributor::route(uint32_t int_id)
         snapshot.score = traceCandidate.score;
         snapshot.candidateCount = candidateCount;
         snapshot.scanCount = scanCount;
+
+        routeCostDecisionCount1ofN++;
+        const bool routeSwitch = previousRouteCostCpu >= 0 &&
+            previousRouteCostCpu != traceCandidate.cpuIndex;
+        std::ostringstream route_cost_line;
+        route_cost_line
+            << "[GIC1N_ROUTE_COST] tick="
+            << static_cast<unsigned long long>(curTick())
+            << " decision_id="
+            << static_cast<unsigned long long>(routeCostDecisionCount1ofN)
+            << " intid=" << int_id
+            << " mode=" << (affinity_routing.IRM ? "1ofn" : "fixed")
+            << " strategy=" << tracePolicy
+            << " selected_pe=" << traceCandidate.cpuIndex
+            << " previous_selected_pe=" << previousRouteCostCpu
+            << " route_switch=" << (routeSwitch ? 1U : 0U)
+            << " candidate_count="
+            << static_cast<unsigned long long>(candidateCount)
+            << " scan_length="
+            << static_cast<unsigned long long>(scanCount)
+            << " scan_ops="
+            << static_cast<unsigned long long>(scanCount)
+            << " sticky_reuse=" << (stickyReuse ? 1U : 0U)
+            << " sticky_fallback=" << (stickyFallback ? 1U : 0U)
+            << " pending_selected=" << traceCandidate.pendingCount
+            << " active_selected=" << traceCandidate.activeCount
+            << " busy_selected=" << (traceCandidate.busy ? 1U : 0U)
+            << " recent_load=" << traceCandidate.recentRouteCount
+            << " score_selected="
+            << static_cast<unsigned long long>(traceCandidate.score);
+        oneOfNTraceLines.emplace_back(route_cost_line.str());
+        inform("%s", route_cost_line.str());
+        lastRouteCostCpu1ofN = traceCandidate.cpuIndex;
     }
 
     return target_cpu_interface;
@@ -1829,7 +1882,7 @@ Gicv3Distributor::update()
                 const auto &snapshot = pendingTraceSnapshots[selected_intid];
                 if (snapshot.valid) {
                   const bool one_of_n =
-                                  rqAffinityRouting[selected_intid].IRM;
+                                  irqAffinityRouting[selected_intid].IRM;
                   std::ostringstream route_line;
                   route_line
                    << "[GIC1N_ROUTE] tick="

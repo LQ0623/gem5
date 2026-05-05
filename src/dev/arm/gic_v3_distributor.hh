@@ -353,6 +353,8 @@ class Gicv3Distributor : public Serializable
     uint64_t totalCandidateCount1ofN;
     uint64_t busyHitCount1ofN;
     uint64_t routeSwitchCount1ofN;
+    uint64_t routeCostDecisionCount1ofN;
+    int32_t lastRouteCostCpu1ofN;
 
     uint32_t routeDecayWindow;
     uint32_t stickyScoreThreshold;

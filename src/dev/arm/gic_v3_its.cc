@@ -137,6 +137,15 @@ Gicv3Its::syncPendingVirtualLpis(Gicv3Redistributor *rd)
         DPRINTF(ITS, "syncPendingVirtualLpis replay cpu=%u vpe=%u vintid=%u group=%d\n",
                 rd->processorNumber(), residentVpeId, virtualIrq.vintid,
                 virtualIrq.group);
+        inform("[VGIC_LR_PRESSURE] tick=%llu event=refill_attempt "
+               "irq_type=vLPI path=direct vpe=%u intid=%u "
+               "injection_id=-1 burst_id=-1 position_in_burst=-1 "
+               "lr_capacity=%u lr_occupancy_before=-1 "
+               "lr_occupancy_after=-1 lr_index=-1 queued_depth=-1 "
+               "pending_depth=-1 cpu=%u reason=syncPendingVirtualLpis",
+               static_cast<unsigned long long>(curTick()), residentVpeId,
+               virtualIrq.vintid,
+               16U, rd->processorNumber());
         if (!rd->injectOrPendVLPI(residentVpeId, virtualIrq.vintid,
                                   vpe->vptAddr, vpe->vptIdBits,
                                   virtualIrq.doorbellIntid,

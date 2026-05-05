@@ -42,6 +42,7 @@
 
 #include "arch/arm/faults.hh"
 #include "arch/arm/isa.hh"
+#include "base/logging.hh"
 #include "debug/GIC.hh"
 #include "dev/arm/gic_v3.hh"
 #include "dev/arm/gic_v3_distributor.hh"
@@ -55,6 +56,47 @@ using namespace ArmISA;
 
 const uint8_t Gicv3CPUInterface::GIC_MIN_BPR;
 const uint8_t Gicv3CPUInterface::GIC_MIN_BPR_NS;
+
+static constexpr uint32_t Exp10VgicNumListRegs = 16;
+static constexpr uint64_t Exp10IchLrStateInvalid = 0;
+
+static uint32_t
+vgicLrOccupancy(ISA *isa)
+{
+    uint32_t occ = 0;
+
+    for (int lrIdx = 0; lrIdx < Exp10VgicNumListRegs; lrIdx++) {
+        const uint64_t lrRaw =
+            isa->readMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lrIdx);
+        if (bits(lrRaw, 63, 62) != Exp10IchLrStateInvalid) {
+            occ++;
+        }
+    }
+
+    return occ;
+}
+
+static const char *
+vgicIrqType(uint32_t intid)
+{
+    return intid < Gicv3::SGI_MAX ? "vSGI" : "vLPI";
+}
+
+static void
+vgicLrPressureTrace(const char *event, uint32_t cpuId, uint32_t intid,
+                    uint32_t occBefore, uint32_t occAfter, int lrIndex,
+                    const char *reason)
+{
+    inform("[VGIC_LR_PRESSURE] tick=%llu event=%s irq_type=%s path=direct "
+           "vpe=-1 intid=%u injection_id=-1 burst_id=-1 "
+           "position_in_burst=-1 lr_capacity=%u lr_occupancy_before=%u "
+           "lr_occupancy_after=%u lr_index=%d queued_depth=-1 "
+           "pending_depth=-1 cpu=%u reason=%s",
+           static_cast<unsigned long long>(curTick()), event,
+           vgicIrqType(intid), intid,
+           Exp10VgicNumListRegs, occBefore, occAfter, lrIndex, cpuId,
+           reason);
+}
 
 Gicv3CPUInterface::Gicv3CPUInterface(Gicv3 * gic, ThreadContext *_tc)
     : BaseISADevice(),
@@ -100,6 +142,10 @@ Gicv3CPUInterface::injectVirtualLPI(uint32_t intid, uint8_t priority,
      */
     const uint8_t encodedPrio = priority & 0xf8;
     int freeIdx = -1;
+    const uint32_t occBefore = vgicLrOccupancy(isa);
+
+    vgicLrPressureTrace("inject_attempt", cpuId, intid, occBefore,
+                        occBefore, -1, "enter_injectVirtualLPI");
 
     for (int lrIdx = 0; lrIdx < VIRTUAL_NUM_LIST_REGS; lrIdx++) {
         ICH_LR_EL2 ich_lr_el2 =
@@ -119,10 +165,18 @@ Gicv3CPUInterface::injectVirtualLPI(uint32_t intid, uint8_t priority,
                 ich_lr_el2.Group = group == Gicv3::G1NS ? 1 : 0;
                 isa->setMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lrIdx, ich_lr_el2);
                 virtualUpdate();
-                DPRINTF(GIC, "injectVirtualLPI cpu=%u intid=%u lr=%d action=upgrade_active_pending\n",
+                vgicLrPressureTrace("lr_duplicate", cpuId, intid, occBefore,
+                                    vgicLrOccupancy(isa), lrIdx,
+                                    "upgrade_active_pending");
+                DPRINTF(GIC, "injectVirtualLPI cpu=%u intid=%u lr=%d
+                            action=upgrade_active_pending\n",
                         cpuId, intid, lrIdx);
             } else {
-                DPRINTF(GIC, "injectVirtualLPI cpu=%u intid=%u lr=%d action=already_carried state=%u\n",
+                vgicLrPressureTrace("lr_duplicate", cpuId, intid, occBefore,
+                                    vgicLrOccupancy(isa), lrIdx,
+                                    "already_carried");
+                DPRINTF(GIC, "injectVirtualLPI cpu=%u intid=%u lr=%d
+                                action=already_carried state=%u\n",
                         cpuId, intid, lrIdx, ich_lr_el2.State);
             }
             // Returning success is only valid if the LR already carries the
@@ -133,6 +187,8 @@ Gicv3CPUInterface::injectVirtualLPI(uint32_t intid, uint8_t priority,
     }
 
     if (freeIdx < 0) {
+        vgicLrPressureTrace("lr_full", cpuId, intid, occBefore,
+                            vgicLrOccupancy(isa), -1, "no_free_lr");
         DPRINTF(GIC, "injectVirtualLPI cpu=%u intid=%u action=lr_full\n",
                 cpuId, intid);
         return false;
@@ -146,7 +202,10 @@ Gicv3CPUInterface::injectVirtualLPI(uint32_t intid, uint8_t priority,
     ich_lr_el2.EOI = 0;
     ich_lr_el2.vINTID = intid;
     isa->setMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + freeIdx, ich_lr_el2);
-    DPRINTF(GIC, "injectVirtualLPI cpu=%u intid=%u lr=%d action=allocate_new\n",
+    vgicLrPressureTrace("lr_alloc", cpuId, intid, occBefore,
+                        vgicLrOccupancy(isa), freeIdx, "allocate_new");
+    DPRINTF(GIC, "injectVirtualLPI cpu=%u intid=%u lr=%d
+                    action=allocate_new\n",
             cpuId, intid, freeIdx);
     virtualUpdate();
     return true;
@@ -196,16 +255,27 @@ Gicv3CPUInterface::injectVirtualSGI(uint32_t intid, uint8_t priority,
      * - 其余 LR 分配/duplicate 处理完全复用 vLPI 逻辑。
      */
     if (intid >= Gicv3::SGI_MAX) {
+        const uint32_t occ = vgicLrOccupancy(isa);
+        vgicLrPressureTrace("rejected", cpuId, intid, occ, occ, -1,
+                            "vsgi_intid_out_of_range");
         warn("injectVirtualSGI cpu=%u rejected: intid=%u out of SGI range\n",
              cpuId, intid);
         return false;
     }
     if (group != Gicv3::G1NS) {
+        const uint32_t occ = vgicLrOccupancy(isa);
+        vgicLrPressureTrace("rejected", cpuId, intid, occ, occ, -1,
+                            "vsgi_group_not_supported");
         warn("injectVirtualSGI cpu=%u rejected: unsupported group=%u\n",
              cpuId, static_cast<unsigned>(group));
         return false;
     }
 
+    {
+        const uint32_t occ = vgicLrOccupancy(isa);
+        vgicLrPressureTrace("vsgi_reuse_helper", cpuId, intid, occ, occ,
+                            -1, "injectVirtualSGI_calls_injectVirtualLPI");
+    }
     return injectVirtualLPI(intid, priority, group);
 }
 
@@ -2039,6 +2109,9 @@ Gicv3CPUInterface::virtualActivateIRQ(uint32_t lr_idx)
     // Move interrupt state from pending to active.
     ich_lr_el.State = ICH_LR_EL2_STATE_ACTIVE;
     isa->setMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx, ich_lr_el);
+    vgicLrPressureTrace("guest_visible", cpuId, ich_lr_el.vINTID,
+                        vgicLrOccupancy(isa), vgicLrOccupancy(isa), lr_idx,
+                        "virtual_activate");
 }
 
 void
@@ -2064,6 +2137,7 @@ Gicv3CPUInterface::deactivateIRQ(uint32_t int_id, Gicv3::GroupId group)
 void
 Gicv3CPUInterface::virtualDeactivateIRQ(int lr_idx)
 {
+    const uint32_t occBefore = vgicLrOccupancy(isa);
     ICH_LR_EL2 ich_lr_el2 = isa->readMiscRegNoEffect(MISCREG_ICH_LR0_EL2 +
             lr_idx);
     const uint32_t vint_id = ich_lr_el2.vINTID;
@@ -2081,6 +2155,15 @@ Gicv3CPUInterface::virtualDeactivateIRQ(int lr_idx)
         //  Remove the active bit
     ich_lr_el2.State = ich_lr_el2.State & ~ICH_LR_EL2_STATE_ACTIVE;
     isa->setMiscRegNoEffect(MISCREG_ICH_LR0_EL2 + lr_idx, ich_lr_el2);
+    vgicLrPressureTrace("eoi", cpuId, vint_id, occBefore,
+                        vgicLrOccupancy(isa), lr_idx,
+                        "virtual_deactivate");
+
+    if (ich_lr_el2.State == ICH_LR_EL2_STATE_INVALID) {
+        vgicLrPressureTrace("lr_clear", cpuId, vint_id, occBefore,
+                            vgicLrOccupancy(isa), lr_idx,
+                            "lr_state_invalid_after_deactivate");
+    }
 
     if (vint_id < Gicv3::SGI_MAX) {
         /*

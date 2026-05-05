@@ -58,6 +58,25 @@ using namespace ArmISA;
 const AddrRange Gicv3Redistributor::GICR_IPRIORITYR(SGI_base + 0x0400,
                                                     SGI_base + 0x0420);
 
+static constexpr uint32_t Exp10VgicNumListRegs = 16;
+
+static void
+redistributorVgicPressureTrace(const char *event, uint32_t cpuId,
+                               const char *irqType, uint16_t vpeId,
+                               uint32_t intid, int occBefore,
+                               int occAfter, int lrIndex,
+                               const char *reason)
+{
+    inform("[VGIC_LR_PRESSURE] tick=%llu event=%s irq_type=%s path=direct "
+           "vpe=%u intid=%u injection_id=-1 burst_id=-1 "
+           "position_in_burst=-1 lr_capacity=%u lr_occupancy_before=%u "
+           "lr_occupancy_after=%u lr_index=%d queued_depth=-1 "
+           "pending_depth=-1 cpu=%u reason=%s",
+           static_cast<unsigned long long>(curTick()), event, irqType, vpeId,
+           intid, Exp10VgicNumListRegs, occBefore, occAfter, lrIndex, cpuId,
+           reason);
+}
+
 Gicv3Redistributor::Gicv3Redistributor(Gicv3 * gic, uint32_t cpu_id)
     : gic(gic),
       distributor(nullptr),
@@ -1584,10 +1603,16 @@ Gicv3Redistributor::injectOrPendVSGI(uint16_t vpeId, Addr vptAddr,
     }
 
     if (!cpuInterface->injectVirtualSGI(vintId, priority, Gicv3::G1NS)) {
+        redistributorVgicPressureTrace("pending_set", cpuId, "vSGI", vpeId,
+                                       vintId, -1, -1,
+                                       -1, "injectVirtualSGI_failed");
         return false;
     }
 
     setClrVSGIPending(vpeId, vptAddr, vptIdBits, vintId, false, false);
+    redistributorVgicPressureTrace("direct_alloc", cpuId, "vSGI", vpeId,
+                                   vintId, -1, -1,
+                                   -1, "injectOrPendVSGI_delivered");
     DPRINTF(GIC, "injectOrPendVSGI cpu=%u vpe=%u vintid=%u action=delivered\n",
             cpuId, vpeId, vintId);
     return true;
@@ -1884,13 +1909,20 @@ Gicv3Redistributor::injectOrPendVLPI(uint16_t vpeId, uint32_t vintId,
 
     if (!cpuInterface->injectVirtualLPI(vintId, priority, group)) {
         // LR 满时保留 pending，等待后续 EOI/DIR 或 schedule/replay 消费。
+        redistributorVgicPressureTrace("pending_set", cpuId, "vLPI", vpeId,
+                                       vintId, -1, -1,
+                                       -1, "injectVirtualLPI_failed");
         DPRINTF(GIC, "injectOrPendVLPI cpu=%u vintid=%u"
                 " action=lr_unavailable\n",
                 cpuId, vintId);
         return false;
     }
 
-    DPRINTF(GIC, "injectOrPendVLPI cpu=%u vintid=%u action=delivered_clear_pending\n",
+    redistributorVgicPressureTrace("direct_alloc", cpuId, "vLPI", vpeId,
+                                   vintId, -1, -1,
+                                   -1, "injectOrPendVLPI_delivered");
+    DPRINTF(GIC, "injectOrPendVLPI cpu=%u vintid=%u
+                action=delivered_clear_pending\n",
             cpuId, vintId);
     /*
      * 直注入成功后仅清 vPT pending，不清 LR 中刚写入的 pending：
